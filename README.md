@@ -28,14 +28,31 @@ claude_auto ──► 로컬 프록시 (127.0.0.1:8787) ──► qwen3.8-27b   
 
 ## 1. JEV-27B 서빙과 확인
 
+기존 qwen3.8-27b 서버와 같은 형태(`docker run -d --gpus '"device=..."' -p ... --ipc=host --name ...`)로 띄웁니다.
+
 ```bash
-bash download_jev27b.sh /models/JEV-27B
-MODEL_DIR=/models/JEV-27B PORT=8000 bash serve/serve_jev27b.sh        # 분류 전용
-# 80GB 미만 GPU라면 TP=2, 생성 겸용으로 쓰려면 MODE=shared
+bash download_jev27b.sh /data/models/JEV-27B
+
+# 분류 전용 (max-model-len 4096)
+IMAGE=<기존 qwen3.8-27b 서버가 쓰는 vLLM 이미지> \
+MODEL_DIR=/data/models/JEV-27B GPUS=0,1,2,3 HOST_PORT=8000 \
+  bash serve/serve_jev27b.sh start          # 컨테이너 시작 후 준비될 때까지 대기
+
+# 생성 겸용: 27b 풀의 4번째 서버로도 사용 (max-model-len은 다른 27b 서버와 맞추세요)
+MODE=shared MAX_LEN=131072 ... bash serve/serve_jev27b.sh start
+
+bash serve/serve_jev27b.sh status | logs | stop | restart
+DRY_RUN=1 bash serve/serve_jev27b.sh       # 실행될 docker 명령만 확인
 
 pip install -r requirements.txt
-python serve/smoke_test.py --url http://localhost:8000 --model-dir /models/JEV-27B
+python serve/smoke_test.py --url http://localhost:8000 --model-dir /data/models/JEV-27B
 ```
+
+- 모델 폴더는 컨테이너의 `/models/JEV-27B`에 읽기 전용으로 마운트하고, `HF_HUB_OFFLINE=1`로 HF 접속 없이 실행합니다.
+- `TP`는 기본으로 `GPUS` 개수를 씁니다.
+- 기존 스크립트의 다른 옵션은 `EXTRA_DOCKER_ARGS`(docker run 쪽: `-e`, `-v` 등)와 `EXTRA_ARGS`(vllm serve 쪽)로 그대로 넘기면 됩니다.
+- 이미지는 Qwen3.5 계열, `lm_head` LoRA, `--logprobs-mode`, `allowed_token_ids`를 지원해야 합니다. 기존 qwen3.8-27b 서버가 쓰는 이미지를 먼저 시도하세요.
+- 호스트에서 바로 실행하려면 `RUNTIME=native`.
 
 `smoke_test.py`는 모델 카드 예시(환불 요청 P(true)≈0.978, 공급사 질문 → dual_source)와 비교해 결과를 판정합니다.
 
