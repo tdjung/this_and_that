@@ -76,7 +76,7 @@ claude_auto                            # 평소 claude 대신 실행
 - 프록시가 없으면 백그라운드로 띄우고, 마지막 `claude_auto` 세션이 끝나면 종료합니다 (`CLAUDE_AUTO_KEEP_PROXY=1`로 유지).
 - 세션 안에서 `/model opus` → Opus 강제, `/model sonnet` → 자동 라우팅 복귀, `/model claude-tier-fable` → Fable 강제.
 - 로그: `~/.claude_auto/proxy.log`, 라우팅 결정: `~/.claude_auto/decisions.jsonl`
-- 상태 확인: `curl localhost:8787/health`, `curl localhost:8787/sessions`
+- 상태 확인: `curl localhost:8787/health` (티어별 분류·처리 건수 포함), `/sessions`, `/backends` (서버별 부하), `/budget`
 
 ### 라우팅 규칙
 
@@ -87,7 +87,30 @@ claude_auto                            # 평소 claude 대신 실행
 5. 세션 정책 `upgrade_only`: 한 세션에서 티어는 올라가기만 함 (모델 전환에 따른 프롬프트 캐시 손실 방지). 컴팩션 직후에는 다시 내려갈 수 있음
 6. 연속 도구 에러 3회 → 한 단계 상향
 7. 컨텍스트가 티어의 `max_context`를 넘으면 상향
-8. 내부 백엔드 연결 실패/5xx → 다음 티어로 재시도. Anthropic 사용량 한도(429, retry-after 60초 이상) → 가장 높은 내부 티어로 하향하고 30분간 Anthropic 건너뜀
+8. 예산 압박(`budget`)이 있으면 새 프롬프트부터 외부 티어를 내부로 치환 (아래 참고)
+9. 서버 선택: 같은 세션은 같은 서버로 (vLLM 프리픽스 캐시 유지). 그 서버가 바쁘거나 죽었으면 같은 풀의 다른 서버 → `overflow` 티어 → 한 단계 위 티어 순서로 시도
+10. Anthropic 사용량 한도(429, retry-after 60초 이상) → 가장 높은 내부 티어로 하향하고 30분간 Anthropic 건너뜀
+
+### 서버 풀과 부하
+
+- `backends.<이름>.servers`에 같은 모델 서버를 여러 대 적습니다. 예시 설정은 qwen3.8-27b 3대(+JEV-27B를 `MODE=shared`로 띄우면 4번째, `weight` 낮게), flash-next 1대입니다.
+- `metrics: true`면 각 서버의 vLLM `/metrics`(실행 중/대기 중 요청 수)를 5초마다 읽습니다. 프록시가 개발자마다 하나씩 돌기 때문에, 다른 사람의 부하는 서버 지표로만 보입니다. 프록시가 쉬는 동안(2분 이상 요청 없음)은 읽지 않습니다.
+- 대기열이 `max_waiting`을 넘으면 '바쁨'입니다. flash-next는 1대라 `max_waiting: 2`로 낮게 두고, 바쁘면 27b 풀로 넘기도록 `overflow: [qwen3.8-27b]`를 걸었습니다. Anthropic으로는 새지 않습니다.
+- `/health`의 `stats.decided`(분류 결과)와 `stats.served`(실제 처리)를 비교하면 overflow가 얼마나 일어나는지 보입니다. flash-next 비중이 서버 대수 비율(약 20%)보다 계속 높다면 `tiers[].criteria`를 조정해 일부 작업을 27b 티어로 옮기세요.
+
+### 외부 모델 예산
+
+레벨은 `normal` → `tight` → `critical`이고, 아래 세 신호 중 가장 나쁜 값을 씁니다.
+
+| 신호 | 방식 |
+|---|---|
+| 예산 조회 (`budget.source`) | HTTP URL 또는 명령어가 JSON을 반환. `{"level": "tight"}` 또는 `{"remaining": 3200, "limit": 10000}`. 남은 예산 비율이 남은 기간 비율 × 0.8보다 작으면 `tight`, 5% 미만이면 `critical` |
+| 응답 헤더 | Anthropic 응답의 `anthropic-ratelimit-unified-*`에서 경고/거부 상태, 높은 사용률을 감지 (휴리스틱) |
+| 수동 | `curl -XPOST localhost:8787/budget -d '{"level":"tight","minutes":240}'`, 해제는 `{"level":null}` |
+
+레벨별 동작은 `budget.policy`로 정합니다. 기본값은 `tight`에서 sonnet급만 flash-next로, `critical`에서 sonnet/opus/fable급 모두 내부로 보냅니다. `tight`는 새 프롬프트부터만 적용해서 진행 중인 작업은 같은 모델로 끝냅니다. `/model`로 직접 고른 모델은 치환하지 않습니다. 컨텍스트가 내부 모델에 안 들어가는 요청은 치환하지 않습니다.
+
+사내 사용량 조회 수단(API, MCP 등)이 있으면 그것을 감싸 JSON을 출력하는 스크립트를 `source: {type: command}`로 연결하면 됩니다. 이렇게 하면 "월초에 다 쓰고 남은 기간은 내부 모델만" 대신 **월말까지 페이스를 맞춰 쓰는** 방식이 됩니다.
 
 ### 도입 순서 권장
 

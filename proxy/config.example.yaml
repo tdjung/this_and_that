@@ -39,15 +39,37 @@ jev:
 #   bearer      : Authorization: Bearer $<env>
 #   api_key     : x-api-key: $<env>
 #   none        : 인증 헤더 없음
+#
+# servers: 같은 모델을 서빙하는 서버 목록. 세션별로 같은 서버에 붙여 vLLM 프리픽스 캐시를 살리고,
+#          그 서버가 바쁘거나 죽었으면 덜 바쁜 서버로 보냅니다.
+# metrics: true면 각 서버의 vLLM /metrics(num_requests_running/waiting)를 metrics_interval_s마다 읽어
+#          부하를 판단합니다. 모든 개발자가 각자 로컬 프록시를 쓰므로, 서버 지표가 있어야 다른 사람의
+#          부하까지 보입니다. /metrics가 막혀 있으면 false로 두세요(응답 429/503만으로 판단).
+# max_waiting: 대기열이 이 값을 넘는 서버는 '바쁨'으로 보고 다른 서버/overflow 티어로 보냅니다.
+metrics_interval_s: 5
+
 backends:
   internal-27b:
-    base_url: http://qwen27b.internal:8000      # TODO: Anthropic /v1/messages 호환 엔드포인트
+    servers:                                     # TODO: Anthropic /v1/messages 호환 엔드포인트들
+      - {url: http://qwen27b-1.internal:8000}
+      - {url: http://qwen27b-2.internal:8000}
+      - {url: http://qwen27b-3.internal:8000}
+      # JEV-27B 서버를 MODE=shared로 띄웠다면 4번째 27b 서버로 쓸 수 있습니다 (백본이 동일).
+      # 분류 요청과 GPU를 나눠 쓰므로 weight를 낮게 두세요.
+      # - {url: http://jev27b.internal:8000, model: autotrust/JEV-27B, weight: 0.5}
+    metrics: true
+    max_waiting: 4
     auth: {mode: bearer, env: INTERNAL_LLM_TOKEN}
   internal-fn:
-    base_url: http://qwen-fn.internal:8000      # TODO
+    servers:
+      - {url: http://qwen-fn.internal:8000}      # TODO: flash-next는 1대
+    metrics: true
+    max_waiting: 2                               # 1대뿐이라 대기열이 조금만 쌓여도 27b로 넘김
     auth: {mode: bearer, env: INTERNAL_LLM_TOKEN}
   anthropic:
-    base_url: https://api.anthropic.com         # TODO: 사내 외부모델 게이트웨이 주소라면 그 주소
+    servers:
+      - {url: https://api.anthropic.com}         # TODO: 사내 외부모델 게이트웨이 주소라면 그 주소
+    external: true                               # 한도/예산 정책 대상
     auth: {mode: passthrough}
     # 추가 헤더가 필요하면:
     # extra_headers: {x-team-id: my-team}
@@ -59,6 +81,7 @@ tiers:
     backend: internal-27b
     model: qwen3.8-27b                           # TODO: 백엔드가 기대하는 모델 이름
     max_context: 131072                          # TODO: 실제 서빙 컨텍스트 길이
+    overflow: [qwen3.8-fn]                       # 27b 서버가 전부 바쁘면 flash-next로
     criteria: >-
       A simple question that needs no repository context: general knowledge, arithmetic,
       a command or syntax lookup, translating or rewording text, or a tiny standalone snippet.
@@ -66,6 +89,7 @@ tiers:
     backend: internal-fn
     model: qwen3.8-flash-next                    # TODO
     max_context: 131072                          # TODO
+    overflow: [qwen3.8-27b]                      # flash-next(1대)가 바쁘면 27b 풀로 (Anthropic으로 새지 않게)
     criteria: >-
       Reading and explaining existing code, or a small localized change in one or two files:
       explain a function, add a unit test, fix an obvious bug, rename, add logging, write a short script.
@@ -130,7 +154,41 @@ session:
 # ------------------------------------------------------------------ 실패/한도 대응
 fallback:
   escalate_on_tool_errors: 3        # 연속 도구 에러가 이만큼 쌓이면 한 단계 상향 (0이면 끔)
-  escalate_on_backend_error: true   # 내부 백엔드 연결 실패/5xx면 다음 티어로 재시도
+  escalate_on_backend_error: true   # 티어의 모든 서버와 overflow가 실패하면 한 단계 위 티어로 재시도
+  max_attempts: 4                   # 한 요청에서 시도할 서버 수 (27b 3대 + overflow 1대)
   downgrade_on_quota: true          # Anthropic 쪽 사용량 한도(429)면 가장 높은 내부 티어로 하향
   quota_min_retry_after_s: 60       # retry-after가 이 값 이상이거나 없으면 '한도 소진'으로 판단
   quota_cooldown_minutes: 30        # 한도 소진으로 판단된 백엔드를 건너뛰는 시간
+
+# ------------------------------------------------------------------ 외부 모델 예산
+# 레벨: normal → tight → critical. 세 신호 중 가장 나쁜 값을 씁니다.
+#   1) source  : 예산 조회 (HTTP 또는 명령어). JSON으로
+#                {"level": "tight"}  또는  {"remaining": 3200, "limit": 10000[, "period_start": "...", "period_end": "..."]}
+#                remaining/limit이면 '페이스'로 판단: 남은 예산 비율 < 남은 기간 비율 × tight_when_below_pace → tight
+#   2) 응답 헤더: anthropic-ratelimit-unified-* (status에 warning → tight, rejected → critical, utilization 높으면 tight)
+#   3) 수동    : curl -XPOST localhost:8787/budget -d '{"level":"tight","minutes":240}'
+budget:
+  reset_day: 1                          # 월 예산 리셋일
+  tight_when_below_pace: 0.8
+  critical_when_remaining_below: 0.05
+  use_ratelimit_headers: true
+  header_utilization_tight: 0.8
+  # source:
+  #   type: http
+  #   url: http://usage.internal/api/team/claude-budget    # TODO: 사내 사용량 API
+  #   headers: {Authorization: "Bearer ..."}
+  #   interval_s: 300
+  # source:
+  #   type: command
+  #   command: "python3 ~/bin/claude_budget.py"            # 사내 MCP/CLI를 감싼 스크립트도 가능
+  #   interval_s: 300
+
+  # 레벨별 티어 치환. 새 프롬프트를 분류할 때 적용 (critical은 진행 중인 작업에도 적용).
+  # /model 로 직접 고른 모델(claude-tier-*)은 치환하지 않음.
+  policy:
+    tight:                              # 예산이 페이스보다 빠르게 줄고 있음: sonnet급은 내부로, 어려운 일만 외부
+      sonnet: qwen3.8-fn
+    critical:                           # 거의 소진: 외부 모델은 /model로 직접 고를 때만
+      sonnet: qwen3.8-fn
+      opus: qwen3.8-fn
+      fable: qwen3.8-fn

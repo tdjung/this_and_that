@@ -65,8 +65,10 @@ class Upstream:
             status, headers = q.pop(0)
             return resp(status, {"content-type": "application/json", **headers},
                         b'{"type":"error","error":{"message":"x"}}')
-        return resp(200, {"content-type": "text/event-stream",
-                          "anthropic-ratelimit-unified-status": "allowed"}, SSE)
+        hdr = {"content-type": "text/event-stream", "anthropic-ratelimit-unified-status": "allowed"}
+        if host == "api.anthropic.com":
+            hdr.update(getattr(self, "extra_headers", {}))
+        return resp(200, hdr, SSE)
 
     def last(self):
         r = self.requests[-1]
@@ -80,7 +82,7 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setenv("INTERNAL_LLM_TOKEN", "internal-secret")
     up = Upstream()
     jev = FakeJev(raw["tiers"])
-    app = create_app(raw, transport=httpx.MockTransport(up), jev=jev)
+    app = create_app(raw, transport=httpx.MockTransport(up), jev=jev, background=False)
     with TestClient(app) as c:
         yield c, up, jev, raw
 
@@ -211,10 +213,22 @@ def test_tool_errors_escalate(env):
     assert post(c, msgs_tool("fix", error=True)).headers["x-claude-auto-tier"] == "sonnet"
 
 
-def test_internal_5xx_escalates(env):
+def test_internal_5xx_tries_another_server_in_pool(env):
     c, up, jev, _ = env
     jev.next = "qwen3.8-27b"
-    up.script["qwen27b.internal"] = [(503, {})]
+    post(c, msgs_user("q"))
+    first = up.last()[0]
+    up.script[first] = [(503, {})]
+    r = post(c, msgs_tool("q"))
+    assert r.status_code == 200 and r.headers["x-claude-auto-tier"] == "qwen3.8-27b"
+    assert up.last()[0] != first and up.last()[0].startswith("qwen27b-")
+
+
+def test_all_27b_failing_overflows_to_fn(env):
+    c, up, jev, _ = env
+    jev.next = "qwen3.8-27b"
+    for i in (1, 2, 3):
+        up.script[f"qwen27b-{i}.internal"] = [(503, {})]
     r = post(c, msgs_user("q"))
     assert r.status_code == 200 and r.headers["x-claude-auto-tier"] == "qwen3.8-fn"
 
@@ -263,3 +277,121 @@ def test_misc_endpoints(env):
     assert c.head("/api/hello").status_code == 200
     r = c.post("/v1/messages/count_tokens", json={"model": "claude-auto", "messages": msgs_user("hi")})
     assert r.status_code == 404
+
+
+# ------------------------------------------------------------------ pools
+def test_session_affinity_and_spread(env):
+    c, up, jev, _ = env
+    jev.next = "qwen3.8-27b"
+    hosts = set()
+    for i in range(20):
+        post(c, msgs_user("q"), sid=f"sess{i}")
+        h1 = up.last()[0]
+        post(c, msgs_tool("q"), sid=f"sess{i}")
+        assert up.last()[0] == h1                                    # same session -> same server
+        hosts.add(h1)
+    assert len(hosts) >= 2                                           # sessions spread over the pool
+
+
+def _busy(router, backend, waiting=99):
+    import time as _t
+    for s in router.backends[backend].servers:
+        s.waiting, s.metrics_ts = waiting, _t.time()
+
+
+def test_busy_27b_pool_spills_to_fn(env):
+    c, up, jev, _ = env
+    jev.next = "qwen3.8-27b"
+    _busy(c.app.state.router, "internal-27b")
+    r = post(c, msgs_user("q"))
+    assert r.headers["x-claude-auto-tier"] == "qwen3.8-fn"
+
+
+def test_busy_fn_spills_to_27b_not_anthropic(env):
+    c, up, jev, _ = env
+    jev.next = "qwen3.8-fn"
+    _busy(c.app.state.router, "internal-fn")
+    r = post(c, msgs_user("q"))
+    assert r.headers["x-claude-auto-tier"] == "qwen3.8-27b"
+    assert up.last()[0].startswith("qwen27b-")
+
+
+def test_everything_busy_still_serves_least_loaded(env):
+    c, up, jev, _ = env
+    jev.next = "qwen3.8-fn"
+    _busy(c.app.state.router, "internal-fn", waiting=10)
+    _busy(c.app.state.router, "internal-27b", waiting=50)
+    r = post(c, msgs_user("q"))
+    assert r.status_code == 200 and r.headers["x-claude-auto-tier"] == "qwen3.8-fn"
+
+
+def test_server_model_override(tmp_path, monkeypatch):
+    raw = yaml.safe_load((ROOT / "proxy" / "config.example.yaml").read_text())
+    raw["log_path"] = str(tmp_path / "log.jsonl")
+    raw["backends"]["internal-27b"]["servers"] = [{"url": "http://jev27b.internal:8000",
+                                                   "model": "autotrust/JEV-27B"}]
+    up = Upstream()
+    jev = FakeJev(raw["tiers"])
+    with TestClient(create_app(raw, transport=httpx.MockTransport(up), jev=jev, background=False)) as c:
+        post(c, msgs_user("q"))
+        host, body, _ = up.last()
+        assert host == "jev27b.internal" and body["model"] == "autotrust/JEV-27B"
+
+
+def test_parse_metrics():
+    from proxy.pool import parse_metrics
+    text = ('# HELP x\nvllm:num_requests_running{model_name="a"} 3.0\n'
+            'vllm:num_requests_waiting{model_name="a"} 7.0\nvllm:num_requests_waiting{model_name="b"} 1\n')
+    assert parse_metrics(text) == (3.0, 8.0)
+
+
+# ------------------------------------------------------------------ budget
+def test_budget_tight_demotes_sonnet_class_only(env):
+    c, up, jev, _ = env
+    assert c.post("/budget", json={"level": "tight", "minutes": 10}).json()["level"] == "tight"
+    jev.next = "sonnet"
+    assert post(c, msgs_user("feature"), sid="b1").headers["x-claude-auto-tier"] == "qwen3.8-fn"
+    jev.next = "opus"
+    assert post(c, msgs_user("architecture"), sid="b2").headers["x-claude-auto-tier"] == "opus"
+    assert post(c, msgs_user("x"), sid="b3", model="claude-tier-sonnet").headers["x-claude-auto-tier"] == "sonnet"
+
+
+def test_budget_tight_does_not_switch_running_prompt(env):
+    c, up, jev, _ = env
+    jev.next = "sonnet"
+    post(c, msgs_user("feature"))
+    c.post("/budget", json={"level": "tight"})
+    assert post(c, msgs_tool("feature")).headers["x-claude-auto-tier"] == "sonnet"   # finish the prompt
+    c.post("/budget", json={"level": "critical"})
+    assert post(c, msgs_tool("feature")).headers["x-claude-auto-tier"] == "qwen3.8-fn"
+    c.post("/budget", json={"level": None})
+    assert c.get("/budget").json()["level"] == "normal"
+
+
+def test_budget_respects_context_size(env):
+    c, up, jev, raw = env
+    c.post("/budget", json={"level": "critical"})
+    jev.next = "qwen3.8-27b"
+    big = "x" * (raw["tiers"][0]["max_context"] * 3)
+    r = post(c, msgs_user("s") + [{"role": "assistant", "content": big}] + msgs_user("again"))
+    assert r.headers["x-claude-auto-tier"] == "sonnet"                # internal can't hold it
+
+
+def test_budget_from_ratelimit_headers(env):
+    c, up, jev, _ = env
+    jev.next = "sonnet"
+    up.extra_headers = {"anthropic-ratelimit-unified-status": "allowed_warning"}
+    post(c, msgs_user("feature"), sid="h1")
+    assert c.get("/budget").json()["level"] == "tight"
+    assert post(c, msgs_user("feature 2"), sid="h2").headers["x-claude-auto-tier"] == "qwen3.8-fn"
+
+
+def test_budget_pacing():
+    import datetime as dt
+    from proxy.budget import Budget
+    b = Budget({"reset_day": 1})
+    now = dt.datetime(2026, 10, 11, tzinfo=dt.timezone.utc)          # ~1/3 into October
+    assert b.level_from_payload({"remaining": 8000, "limit": 10000}, now)[0] == "normal"
+    assert b.level_from_payload({"remaining": 4000, "limit": 10000}, now)[0] == "tight"
+    assert b.level_from_payload({"remaining": 300, "limit": 10000}, now)[0] == "critical"
+    assert b.level_from_payload({"level": "tight"}, now)[0] == "tight"

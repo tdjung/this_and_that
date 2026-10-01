@@ -25,6 +25,7 @@ class Tier:
     model: str
     criteria: str
     max_context: int = 200_000
+    overflow: list[str] = field(default_factory=list)   # tiers to spill to when this tier's servers are busy
 
 
 @dataclass
