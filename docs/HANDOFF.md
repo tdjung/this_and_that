@@ -88,7 +88,7 @@ docker run -d --gpus '"device=0,1,2,3"' -p 8001:8000 --ipc=host --name <이름> 
 | 증상 | 원인 | 해결 |
 |---|---|---|
 | `text_config ... num_attention_heads` 에러 | JEV-27B는 텍스트 전용(`qwen3_5_text`)이라 `text_config`가 없음 | `--hf-overrides`를 최상위 `rope_parameters`로 |
-| `rope_theta` | 원래 명령의 1,000,000이 틀림 | 모델 config 값 10,000,000 (**기존 27b 서버 설정도 확인 필요**) |
+| `rope_theta` | 원래 명령의 1,000,000이 틀림 | 모델 config 값 10,000,000 (기존 27b 서버는 10,000,000으로 확인됨) |
 | `Expected Qwen3_5Config but found Qwen3_5TextConfig` | vLLM v0.26.0의 텍스트 전용 Qwen3.5 버그 | `vllm/vllm-openai:nightly` (0.30.1rc1.dev396) 사용 |
 | `max_model_len > derived` | 환경변수 누락 | `VLLM_ALLOW_LONG_MAX_MODEL_LEN=1` |
 | `No adapter found` | 경로 오타 `adaptor_vllm` | `adapter_vllm` |
@@ -155,7 +155,6 @@ docker run -d --gpus '"device=0,1,2,3"' -p 8001:8000 --ipc=host --name <이름> 
 6. `mode: shadow`로 1~2주 운영 → `~/.claude_auto/decisions.jsonl` 분석 후 `mode: route`
 
 ## 6. 확인이 필요한 사항
-- 기존 qwen3.8-27b 서버의 `rope_theta` 값 (1e6으로 설정돼 있다면 품질 저하 가능)
 - 내부 Qwen 서버가 Anthropic `/v1/messages` 형식을 직접 받는지 (지금 Claude Code가 직접 붙어 있으니 그렇다고 가정 중)
 - Claude Code는 `claude-auto` 같은 모르는 모델 ID를 200K 컨텍스트로 가정함 → 1M을 실제로 쓰려면 런처/프록시 조정 필요
 - Anthropic은 게이트웨이를 통해 Claude Code를 Claude가 아닌 모델로 라우팅하는 구성을 공식 지원하지 않음 (내부 모델 경로의 문제는 자체 확인 필요)
