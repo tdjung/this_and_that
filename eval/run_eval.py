@@ -70,6 +70,9 @@ def main() -> int:
     ap.add_argument("--shuffles", type=int, default=0, help="선택지 순서를 섞어 N번 더 분류 (안정성 확인)")
     ap.add_argument("--out", default=str(ROOT / "eval" / "results"))
     ap.add_argument("--mock", action="store_true")
+    ap.add_argument("--set", choices=["all", "short", "long"], default="all", help="평가할 프롬프트 묶음")
+    ap.add_argument("--budget-level", choices=["normal", "tight", "critical"], default="normal",
+                    help="config budget.policy를 이 레벨로 적용했을 때의 최종 티어를 계산")
     a = ap.parse_args()
 
     raw = yaml.safe_load(Path(a.config).expanduser().read_text())
@@ -84,26 +87,36 @@ def main() -> int:
                         adapter=j.get("adapter", "jev-decision"), timeout=60, api_key=key)
 
     rows = [json.loads(l) for l in Path(a.prompts).read_text().splitlines() if l.strip()]
+    if a.set != "all":
+        rows = [r for r in rows if r.get("set", "short") == a.set]
+    policy = ((raw.get("budget") or {}).get("policy") or {}).get(a.budget_level) or {}
     rng = random.Random(0)
     results = []
-    print(f"{'id':4} {'lang':4} {'expected':12} {'jev':12} {'conf':>5} {'final':12} {'ms':>6}  prompt")
-    print("-" * 110)
+    print(f"budget level = {a.budget_level}  (policy: {policy or '없음'})\n")
+    print(f"{'id':4} {'set':5} {'lang':4} {'len':>5} {'expected':12} {'jev':12} {'conf':>5} {'final':12} {'ms':>6}  prompt")
+    print("-" * 120)
     for r in rows:
         exp = names.index(r["expected"])
         jt, conf, probs, ms = run_one(jev, cfg, r["prompt"])
         d = combine(cfg, r["prompt"], jt, conf, probs)
+        final, reason = d.tier, d.reason
+        rep = policy.get(names[final])
+        if rep in names:
+            reason += f" | budget:{a.budget_level} {names[final]}->{rep}"
+            final = names.index(rep)
         flips = 0
         for _ in range(a.shuffles):
             order = list(range(len(names)))
             rng.shuffle(order)
             if run_one(jev, cfg, r["prompt"], order)[0] != jt:
                 flips += 1
-        mark = "✓" if d.tier == exp else ("▼" if d.tier < exp else "▲")
-        print(f"{r['id']:4} {r['lang']:4} {names[exp]:12} {names[jt]:12} {conf:5.2f} "
-              f"{names[d.tier]:12} {ms:6.0f}  {mark} {r['prompt'][:46]}")
-        results.append({**r, "expected_idx": exp, "jev": names[jt], "jev_idx": jt,
-                        "confidence": round(conf, 4), "final": names[d.tier], "final_idx": d.tier,
-                        "reason": d.reason, "probs": probs, "latency_ms": round(ms, 1),
+        mark = "✓" if final == exp else ("▼" if final < exp else "▲")
+        head = " ".join(r["prompt"].split())[:40]
+        print(f"{r['id']:4} {r.get('set', 'short'):5} {r['lang']:4} {len(r['prompt']):5} {names[exp]:12} {names[jt]:12} "
+              f"{conf:5.2f} {names[final]:12} {ms:6.0f}  {mark} {head}")
+        results.append({**r, "set": r.get("set", "short"), "expected_idx": exp, "jev": names[jt], "jev_idx": jt,
+                        "confidence": round(conf, 4), "final": names[final], "final_idx": final,
+                        "reason": reason, "probs": probs, "latency_ms": round(ms, 1),
                         "shuffle_flips": flips})
 
     # ---------------- summary
@@ -116,14 +129,20 @@ def main() -> int:
         return f"exact {exact}/{n} ({exact / n:.0%}) · ±1 {within}/{n} · under-routed {under} · over-routed {over}"
 
     print("\n=== 요약 ===")
-    print(f"JEV 단독      : {summarize('jev_idx')}")
-    print(f"게이트+룰 적용: {summarize('final_idx')}")
-    print("  under-routed = 기대보다 낮은 모델로 감 (품질 위험) / over-routed = 더 높은 모델로 감 (비용)")
+    print(f"JEV 분류 품질 (기대값 대비)  : {summarize('jev_idx')}")
+    print(f"최종 라우팅 (룰+비용정책 적용): {summarize('final_idx')}")
+    print("  under-routed = 기대보다 낮은 모델로 감 (품질 위험, 비용정책에 의한 의도적 하향 포함)"
+          " / over-routed = 더 높은 모델로 감 (비용)")
+    for st in sorted({x["set"] for x in results}):
+        sub = [x for x in results if x["set"] == st]
+        ex = sum(x["jev_idx"] == x["expected_idx"] for x in sub)
+        mc = sum(x["confidence"] for x in sub) / len(sub)
+        print(f"  [{st}] JEV exact {ex}/{len(sub)} · 평균 확신도 {mc:.2f}")
     for lang in sorted({x["lang"] for x in results}):
         sub = [x for x in results if x["lang"] == lang]
-        ex = sum(x["final_idx"] == x["expected_idx"] for x in sub)
+        ex = sum(x["jev_idx"] == x["expected_idx"] for x in sub)
         mc = sum(x["confidence"] for x in sub) / len(sub)
-        print(f"  [{lang}] final exact {ex}/{len(sub)} · 평균 확신도 {mc:.2f}")
+        print(f"  [{lang}] JEV exact {ex}/{len(sub)} · 평균 확신도 {mc:.2f}")
     lat = sorted(x["latency_ms"] for x in results)
     print(f"  분류 지연: median {lat[len(lat) // 2]:.0f} ms, max {lat[-1]:.0f} ms")
     if a.shuffles:
@@ -141,18 +160,18 @@ def main() -> int:
 
     dist = Counter(x["final"] for x in results)
     internal = sum(dist[t.name] for t in cfg.tiers if not t.backend.startswith("anthropic"))
-    print(f"\n최종 분포: {dict(dist)}  → 내부 모델 처리 비율 {internal}/{len(results)}")
+    print(f"\n최종 분포: { {n: dist[n] for n in names} }  → 내부 모델 처리 비율 {internal}/{len(results)}")
 
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
-    stamp = time.strftime("%Y%m%d-%H%M%S") + ("-mock" if a.mock else "")
+    stamp = time.strftime("%Y%m%d-%H%M%S") + ("-mock" if a.mock else "") + f"-{a.set}-{a.budget_level}"
     (out / f"eval-{stamp}.json").write_text(json.dumps(results, ensure_ascii=False, indent=1))
     with open(out / f"eval-{stamp}.csv", "w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f)
-        w.writerow(["id", "lang", "expected", "jev", "confidence", "final", "reason", "shuffle_flips",
+        w.writerow(["id", "set", "lang", "expected", "jev", "confidence", "final", "reason", "shuffle_flips",
                     "latency_ms", "prompt"] + [f"p_{n}" for n in names])
         for x in results:
-            w.writerow([x["id"], x["lang"], x["expected"], x["jev"], x["confidence"], x["final"],
+            w.writerow([x["id"], x["set"], x["lang"], x["expected"], x["jev"], x["confidence"], x["final"],
                         x["reason"], x["shuffle_flips"], x["latency_ms"], x["prompt"]]
                        + [x["probs"].get(n) for n in names])
     print(f"\n결과 저장: {out}/eval-{stamp}.csv, .json")

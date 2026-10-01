@@ -18,8 +18,8 @@ claude_auto ──► 로컬 프록시 (127.0.0.1:8787) ──► qwen3.8-27b   
 | `download_jev27b.sh` | hf CLI 없이 wget으로 JEV-27B 다운로드 + SHA256 검증 |
 | `serve/serve_jev27b.sh` | 모델 카드 권장 설정으로 vLLM 서빙 (`decision` / `shared` 모드) |
 | `serve/smoke_test.py` | 서빙 확인: 모델 목록, System 2 생성, System 1 판정, 지연시간 |
-| `eval/prompts.jsonl` | 기대 티어가 달린 평가용 프롬프트 30개 (한국어 21, 영어 9) |
-| `eval/run_eval.py` | 30개 프롬프트 분류 → 정확도, 과소/과대 라우팅, 혼동 행렬, CSV |
+| `eval/prompts.jsonl` | 기대 티어가 달린 평가용 프롬프트 50개: 짧은 30개 + 코드·로그·파일 목록을 붙인 긴 20개 (`eval/make_long_prompts.py`로 생성) |
+| `eval/run_eval.py` | 프롬프트 분류 → 정확도, 과소/과대 라우팅, 혼동 행렬, 예산 레벨별 최종 분포, CSV |
 | `proxy/server.py` | 라우팅 프록시 (Anthropic Messages API 호환) |
 | `proxy/config.example.yaml` | 프록시·티어·룰 설정 예시 |
 | `bin/claude_auto` | 프록시를 띄우고 Claude Code를 그 프록시로 실행하는 런처 |
@@ -56,26 +56,29 @@ python serve/smoke_test.py --url http://localhost:8000 --model-dir /data/models/
 
 `smoke_test.py`는 모델 카드 예시(환불 요청 P(true)≈0.978, 공급사 질문 → dual_source)와 비교해 결과를 판정합니다.
 
-## 2. 30개 프롬프트 분류 테스트
+## 2. 프롬프트 분류 테스트
 
 ```bash
 cp proxy/config.example.yaml ~/.claude_auto/config.yaml     # jev.base_url, jev.model_dir 수정
-python eval/run_eval.py --shuffles 3
+python eval/run_eval.py                       # 50개 전체
+python eval/run_eval.py --set long            # 긴 프롬프트 20개만
+python eval/run_eval.py --budget-level tight  # 예산이 빠듯할 때 최종 분포
 # 또는 설정 없이 주소만 지정
 python eval/run_eval.py --config proxy/config.example.yaml \
-    --jev-url http://gpu01:8000 --model-dir /models/JEV-27B --shuffles 3
+    --jev-url http://gpu01:8000 --model-dir /models/JEV-27B
 ```
 
 출력에서 볼 것:
-- **JEV 단독 vs 게이트+룰 적용** 정확도 비교
-- **under-routed** (기대보다 낮은 모델로 감, 품질 위험) — 0에 가까워야 함
-- **[ko] / [en]** 별 정확도와 평균 확신도 — JEV-27B는 영어 코퍼스로 학습되어 한국어가 약할 수 있음
-- **선택지 순서 변경 시 바뀐 비율** — 모델 카드 기준 약 7%
+- **JEV 분류 품질**: 기대값과 JEV 판정의 일치율. `expected`는 사람이 붙인 기준선입니다
+- **최종 라우팅**: 룰, 확신도 조건, 비용 정책을 적용한 결과. 비용 정책 때문에 의도적으로 내린 경우도 under-routed에 포함됩니다
+- **[short] / [long]**, **[ko] / [en]** 별 정확도와 평균 확신도
+- **최종 분포**: 티어별 건수와 내부 모델 처리 비율
+- `--shuffles N`: 선택지 순서를 섞어 N번 더 분류해서 답이 바뀌는 비율 확인 (모델 카드 기준 약 7%)
 - 결과 CSV는 `eval/results/`에 저장 (`p_<티어>` 열에 확률)
 
-`--mock`을 붙이면 서버 없이 스크립트 동작만 확인합니다.
+긴 프롬프트는 앞 60%와 뒤 40%만 남기고 가운데를 잘라서 분류합니다(`jev.max_state_chars`, 기본 2000자). 붙여 넣은 코드나 로그는 가운데에 있고 실제 요청은 앞이나 끝에 있는 경우가 많기 때문입니다.
 
-티어 설명(`tiers[].criteria`)과 `jev.confidence_threshold`가 결과에 가장 큰 영향을 줍니다. 결과를 보고 이 두 가지를 먼저 조정하세요.
+`--mock`을 붙이면 서버 없이 스크립트 동작만 확인합니다.
 
 ## 3. 프록시와 claude_auto
 
@@ -117,17 +120,41 @@ claude_auto                            # 평소 claude 대신 실행
 
 ### 외부 모델 예산
 
-레벨은 `normal` → `tight` → `critical`이고, 아래 세 신호 중 가장 나쁜 값을 씁니다.
+레벨은 `normal` → `tight` → `critical`이고, 아래 신호 중 가장 나쁜 값을 씁니다.
 
 | 신호 | 방식 |
 |---|---|
+| 개인 사용 금액 (`budget.monthly_limit_usd`) | 프록시가 Anthropic 응답의 토큰 사용량을 `tiers[].price`로 계산해 `~/.claude_auto/usage.json`에 쌓고, 월 예산 대비 페이스로 판단. `curl localhost:8787/usage`로 이번 달 사용액·월말 예상액 확인 |
 | 예산 조회 (`budget.source`) | HTTP URL 또는 명령어가 JSON을 반환. `{"level": "tight"}` 또는 `{"remaining": 3200, "limit": 10000}`. 남은 예산 비율이 남은 기간 비율 × 0.8보다 작으면 `tight`, 5% 미만이면 `critical` |
 | 응답 헤더 | Anthropic 응답의 `anthropic-ratelimit-unified-*`에서 경고/거부 상태, 높은 사용률을 감지 (휴리스틱) |
 | 수동 | `curl -XPOST localhost:8787/budget -d '{"level":"tight","minutes":240}'`, 해제는 `{"level":null}` |
 
-레벨별 동작은 `budget.policy`로 정합니다. 기본값은 `tight`에서 sonnet급만 flash-next로, `critical`에서 sonnet/opus/fable급 모두 내부로 보냅니다. `tight`는 새 프롬프트부터만 적용해서 진행 중인 작업은 같은 모델로 끝냅니다. `/model`로 직접 고른 모델은 치환하지 않습니다. 컨텍스트가 내부 모델에 안 들어가는 요청은 치환하지 않습니다.
+레벨별 동작은 `budget.policy`로 정합니다. 기본값은 `tight`에서 opus급을 sonnet으로, `critical`에서 sonnet/opus/fable급 모두 내부로 보냅니다. `tight`는 새 프롬프트부터만 적용해서 진행 중인 작업은 같은 모델로 끝냅니다. `/model`로 직접 고른 모델은 치환하지 않습니다. 컨텍스트가 내부 모델에 안 들어가는 요청은 치환하지 않습니다.
 
 사내 사용량 조회 수단(API, MCP 등)이 있으면 그것을 감싸 JSON을 출력하는 스크립트를 `source: {type: command}`로 연결하면 됩니다. 이렇게 하면 "월초에 다 쓰고 남은 기간은 내부 모델만" 대신 **월말까지 페이스를 맞춰 쓰는** 방식이 됩니다.
+
+### 비용 정책 (월 $180 기준)
+
+| 장치 | 기본값 | 효과 |
+|---|---|---|
+| `tiers[fable].auto: false` | fable은 자동 선택 안 함 → opus로 | `/model claude-tier-fable`로만 사용 |
+| `tiers[opus].min_confidence: 0.75` | JEV가 "opus 이상"일 확률이 0.75 미만이면 sonnet | 애매한 opus 판정을 걸러냄 |
+| `jev.low_conf_upgrade_max: sonnet` | 확신도 부족으로 한 단계 올릴 때 sonnet까지만 | 애매하다고 opus로 가지 않음 |
+| `rules.keywords` / `extensions` | RTL·verilog 등은 최소 sonnet | 룰만으로 opus에 가지 않음 |
+| `budget.policy.tight` | opus → sonnet | 페이스를 넘으면 opus를 멈춤 |
+| `budget.policy.critical` | 외부 전부 → qwen3.8-fn | 거의 소진되면 내부만 |
+
+참고로 2026년 10월 기준 API 가격(1M 토큰당)은 Opus 5.5 입력 $4/출력 $20, Sonnet 5.5 $2/$10, Fable 5.1 $10/$50이고, 캐시 읽기는 $0.20~0.25입니다. 회사 계약 단가가 다르면 `tiers[].price`를 고치세요.
+
+#### 기준을 조정하는 방법
+
+1. **1~2주는 그대로 쓰면서 `curl localhost:8787/usage`의 `projected_month_end_usd`를 확인합니다.** 월말 예상액이 180을 넘으면 아래 순서로 조입니다.
+2. **opus가 너무 많이 나가면** `tiers[opus].min_confidence`를 0.75 → 0.85로 올립니다. 가장 먼저 건드릴 값입니다.
+3. **sonnet까지 많이 나가면** `jev.low_conf_upgrade_max`를 `qwen3.8-fn`으로 내려서, 애매한 요청이 외부로 올라가지 않게 합니다.
+4. **월 중반에 이미 많이 썼다면** `budget.tight_when_below_pace`를 0.8 → 0.9로 올려 tight가 더 일찍 켜지게 합니다.
+5. **반대로 품질이 부족하면** (`decisions.jsonl`에서 내부 모델로 갔다가 `/model`로 다시 올린 경우가 많으면) 2~3번을 반대로 풀거나, 자주 틀리는 도메인을 `rules.keywords`에 추가합니다.
+
+값을 바꾼 뒤에는 `python eval/run_eval.py --budget-level normal`과 `--budget-level tight`로 분포가 어떻게 바뀌는지 먼저 확인하세요.
 
 ### 도입 순서 권장
 

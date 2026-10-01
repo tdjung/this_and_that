@@ -26,6 +26,12 @@ class Tier:
     criteria: str
     max_context: int = 200_000
     overflow: list[str] = field(default_factory=list)   # tiers to spill to when this tier's servers are busy
+    # cost controls for expensive tiers
+    auto: bool = True                   # False: never picked automatically (only via /model claude-tier-<name>)
+    auto_fallback: str | None = None    # where an automatic pick goes when auto is False (default: tier below)
+    min_confidence: float | None = None # P(this tier or above) must reach this, else go to below_confidence
+    below_confidence: str | None = None # default: tier below
+    price: dict | None = None           # USD per 1M tokens: input, output, cache_write_5m, cache_write_1h, cache_read
 
 
 @dataclass
@@ -33,6 +39,7 @@ class RoutingConfig:
     tiers: list[Tier]
     question: str = DEFAULT_QUESTION
     confidence_threshold: float = 0.55
+    low_conf_upgrade_max: int | None = None   # the low-confidence +1 never goes above this tier
     fallback_tier: int = 1
     max_state_chars: int = 2000
     context_turns: int = 2
@@ -55,6 +62,7 @@ class RoutingConfig:
             tiers=tiers,
             question=jev.get("question", DEFAULT_QUESTION),
             confidence_threshold=float(jev.get("confidence_threshold", 0.55)),
+            low_conf_upgrade_max=idx(jev["low_conf_upgrade_max"]) if jev.get("low_conf_upgrade_max") else None,
             fallback_tier=idx(jev.get("fallback_tier", names[min(1, len(names) - 1)])),
             max_state_chars=int(jev.get("max_state_chars", 2000)),
             context_turns=int(jev.get("context_turns", 2)),
@@ -63,6 +71,13 @@ class RoutingConfig:
             extension_rules=[(idx(r["min_tier"]), [e.lower().lstrip(".") for e in r["extensions"]])
                              for r in rules.get("extensions", [])],
         )
+
+    def __post_init__(self):
+        names = [t.name for t in self.tiers]
+        for t in self.tiers:
+            for ref in (t.auto_fallback, t.below_confidence):
+                if ref is not None and ref not in names:
+                    raise ValueError(f"tier {t.name}: unknown tier '{ref}'")
 
     def index(self, name: str) -> int:
         for i, t in enumerate(self.tiers):
@@ -131,10 +146,20 @@ def user_prompts(messages: list) -> list[str]:
     return out
 
 
+def head_tail(text: str, limit: int, head: float = 0.6) -> str:
+    """Keep the start and the end of a long prompt: pasted code/logs sit in the middle while the
+    actual request is usually at the start or the end."""
+    if len(text) <= limit:
+        return text
+    h = int(limit * head)
+    t = limit - h - 20
+    return text[:h] + "\n...[중략]...\n" + text[-t:]
+
+
 def build_state(prompts: list[str], cfg: RoutingConfig) -> str:
     if not prompts:
         return ""
-    current = prompts[-1][: cfg.max_state_chars]
+    current = head_tail(prompts[-1], cfg.max_state_chars)
     state = f"Request from a developer to an AI coding assistant:\n{current}"
     earlier = prompts[-1 - cfg.context_turns:-1] if cfg.context_turns else []
     budget = cfg.max_state_chars - len(current)
@@ -180,17 +205,56 @@ def interpret(probs_by_option: dict, cfg: RoutingConfig, order: list[int] | None
     return jt, by_tier[jt], {cfg.tiers[k].name: round(v, 4) for k, v in sorted(by_tier.items())}
 
 
+def _at_least(probs: dict | None, cfg: RoutingConfig, idx: int) -> float | None:
+    """P(tier >= idx) from the per-tier probabilities."""
+    if not probs:
+        return None
+    return sum(probs.get(cfg.tiers[k].name, 0.0) for k in range(idx, len(cfg.tiers)))
+
+
+def _below(cfg: RoutingConfig, idx: int, name: str | None) -> int:
+    return cfg.index(name) if name else max(idx - 1, 0)
+
+
+def apply_cost_controls(cfg: RoutingConfig, tier: int, probs: dict | None, from_rule: bool) -> tuple[int, list[str]]:
+    """auto=False tiers are never chosen automatically; min_confidence gates expensive tiers on
+    P(this tier or above). Rule-forced tiers skip the confidence gate."""
+    notes = []
+    for _ in range(len(cfg.tiers)):
+        t = cfg.tiers[tier]
+        if not t.auto:
+            nxt = _below(cfg, tier, t.auto_fallback)
+            notes.append(f"{t.name} not auto->{cfg.tiers[nxt].name}")
+            tier = nxt
+            continue
+        if t.min_confidence is not None and not from_rule:
+            p = _at_least(probs, cfg, tier)
+            if p is not None and p < t.min_confidence:
+                nxt = _below(cfg, tier, t.below_confidence)
+                notes.append(f"P(>={t.name})={p:.2f}<{t.min_confidence}->{cfg.tiers[nxt].name}")
+                tier = nxt
+                continue
+        break
+    return tier, notes
+
+
 def combine(cfg: RoutingConfig, text: str, jev_tier: int | None, conf: float | None,
             probs: dict | None, jev_error: str | None = None) -> Decision:
     rule_t, rule_why = rule_min_tier(text, cfg)
     if jev_tier is None:
         tier, reason = cfg.fallback_tier, f"jev_unavailable({jev_error})"
-    elif conf is not None and conf < cfg.confidence_threshold and jev_tier < cfg.top:
+    elif conf is not None and conf < cfg.confidence_threshold and jev_tier < cfg.top \
+            and (cfg.low_conf_upgrade_max is None or jev_tier + 1 <= cfg.low_conf_upgrade_max):
         tier, reason = jev_tier + 1, f"jev_low_conf({conf:.2f})->+1"
     else:
         tier, reason = jev_tier, f"jev({conf:.2f})"
+    from_rule = False
     if rule_t is not None and rule_t > tier:
-        tier, reason = rule_t, f"{rule_why} (jev said {cfg.tiers[jev_tier].name if jev_tier is not None else '-'})"
+        tier, from_rule = rule_t, True
+        reason = f"{rule_why} (jev said {cfg.tiers[jev_tier].name if jev_tier is not None else '-'})"
+    tier, notes = apply_cost_controls(cfg, tier, probs, from_rule)
+    if notes:
+        reason += " | " + " | ".join(notes)
     return Decision(tier=tier, reason=reason, jev_tier=jev_tier, confidence=conf, probs=probs,
                     rule_tier=rule_t)
 

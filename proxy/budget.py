@@ -57,6 +57,7 @@ class Budget:
         self.util_tight = float(cfg.get("header_utilization_tight", 0.8))
         self.header_ttl = float(cfg.get("header_ttl_minutes", 15)) * 60
         self.policy = cfg.get("policy", {}) or {}
+        self.meter = None                     # proxy.usage.UsageMeter, set by the server
         self.source_level, self.source_detail, self.source_ts = None, None, 0.0
         self.header_level, self.header_ts = None, 0.0
         self.manual_level, self.manual_until = None, 0.0
@@ -65,7 +66,8 @@ class Budget:
     @property
     def level(self) -> str:
         now = time.time()
-        cands = [self.source_level if now - self.source_ts < max(3 * self.interval, 900) else None,
+        cands = [self.local_level(),
+                 self.source_level if now - self.source_ts < max(3 * self.interval, 900) else None,
                  self.header_level if now - self.header_ts < self.header_ttl else None,
                  self.manual_level if now < self.manual_until else None]
         return max(cands, key=_rank) or "normal"
@@ -94,6 +96,15 @@ class Budget:
         else:
             lvl = "normal"
         return lvl, {"remaining_ratio": round(ratio, 3), "period_left_ratio": round(time_left, 3)}
+
+    def local_level(self) -> str | None:
+        """Level from the proxy's own spend meter against monthly_limit_usd."""
+        if self.meter is None:
+            return None
+        pl = self.meter.payload()
+        if pl is None:
+            return None
+        return self.level_from_payload(pl)[0]
 
     def update_from_headers(self, headers) -> None:
         if not self.use_headers:
@@ -165,6 +176,7 @@ class Budget:
     def status(self) -> dict:
         now = time.time()
         return {"level": self.level,
+                "local": {"level": self.local_level(), **(self.meter.status() if self.meter else {})},
                 "source": {"level": self.source_level, "detail": self.source_detail,
                            "age_s": round(now - self.source_ts) if self.source_ts else None},
                 "headers": {"level": self.header_level,

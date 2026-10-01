@@ -40,6 +40,7 @@ from jevtools.routing import (Decision, RoutingConfig, classify_async, is_tool_r
                               tool_errors, user_prompts)
 from proxy.budget import Budget  # noqa: E402
 from proxy.pool import Backend, Server, parse_metrics  # noqa: E402
+from proxy.usage import SSEUsageTap, UsageMeter  # noqa: E402
 
 log = logging.getLogger("claude_auto")
 
@@ -85,6 +86,11 @@ class Router:
         self.quota_cooldown = float(fb.get("quota_cooldown_minutes", 30)) * 60
         self.metrics_interval = float(raw.get("metrics_interval_s", 5))
         self.budget = Budget(raw.get("budget"))
+        b = raw.get("budget") or {}
+        self.meter = UsageMeter(b.get("usage_path", "~/.claude_auto/usage.json"),
+                                reset_day=int(b.get("reset_day", 1)),
+                                monthly_limit_usd=b.get("monthly_limit_usd"))
+        self.budget.meter = self.meter
         self.blocked: dict[str, float] = {}          # backend -> blocked until (epoch)
         self.sessions: dict[str, Session] = {}
         self.stats = {"decided": {}, "served": {}}
@@ -358,10 +364,22 @@ class Router:
             out_headers = {k: v for k, v in resp.headers.items() if k.lower() not in DROP_RESP_HEADERS}
             out_headers["x-claude-auto-tier"] = tier.name
 
-            async def done(r=resp, s=srv):
+            body_iter = resp.aiter_raw()
+            tap = None
+            if be.external and tier.price and resp.status_code == 200:
+                tap = SSEUsageTap()
+                is_sse = "event-stream" in resp.headers.get("content-type", "")
+                body_iter = self.tapped(resp.aiter_raw(), tap, is_sse)
+
+            async def done(r=resp, s=srv, tp=tap, tr=tier):
                 s.inflight -= 1
                 await r.aclose()
-            return StreamingResponse(resp.aiter_raw(), status_code=resp.status_code, headers=out_headers,
+                if tp is not None and tp.usage:
+                    usd = self.meter.record(tr.model, tp.usage, tr.price)
+                    self.write_log({"ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "kind": "usage",
+                                    "session": info.get("session"), "tier": tr.name,
+                                    "usage": tp.usage, "usd": round(usd, 5)})
+            return StreamingResponse(body_iter, status_code=resp.status_code, headers=out_headers,
                                      background=BackgroundTask(done))
 
         status, headers, content = last_err or (503, {"content-type": "application/json"}, json.dumps(
@@ -370,6 +388,18 @@ class Router:
         self.log_request(info, idx, status, t0)
         headers = {k: v for k, v in headers.items() if k.lower() not in DROP_RESP_HEADERS}
         return Response(content, status_code=status, headers=headers)
+
+    @staticmethod
+    async def tapped(it, tap: SSEUsageTap, is_sse: bool, max_json: int = 2_000_000):
+        buf = b""
+        async for chunk in it:
+            if is_sse:
+                tap.feed(chunk)
+            elif len(buf) < max_json:
+                buf += chunk
+            yield chunk
+        if not is_sse:
+            tap.feed_json(buf)
 
     def log_request(self, info: dict, idx: int, status: int, t0: float):
         rec = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S"), **info, "tier": self.names[idx],
@@ -470,6 +500,18 @@ def create_app(raw: dict, transport=None, jev=None, background: bool = True) -> 
         return {k[-20:]: {"tier": router.names[v.tier] if v.tier is not None else None,
                           "tool_errors": v.tool_errors, "idle_s": round(time.time() - v.updated)}
                 for k, v in router.sessions.items()}
+
+    @app.get("/usage")
+    async def usage_get():
+        return router.meter.status()
+
+    @app.post("/usage")
+    async def usage_set(request: Request):
+        d = await request.json()
+        if "set_spent_usd" not in d:
+            return JSONResponse({"error": 'body: {"set_spent_usd": <number>}'}, status_code=400)
+        router.meter.set_spent(float(d["set_spent_usd"]))
+        return router.meter.status()
 
     @app.get("/budget")
     async def budget_get():

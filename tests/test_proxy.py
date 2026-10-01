@@ -68,6 +68,7 @@ class Upstream:
         hdr = {"content-type": "text/event-stream", "anthropic-ratelimit-unified-status": "allowed"}
         if host == "api.anthropic.com":
             hdr.update(getattr(self, "extra_headers", {}))
+            return resp(200, hdr, getattr(self, "sse", SSE))
         return resp(200, hdr, SSE)
 
     def last(self):
@@ -79,6 +80,7 @@ class Upstream:
 def env(tmp_path, monkeypatch):
     raw = yaml.safe_load((ROOT / "proxy" / "config.example.yaml").read_text())
     raw["log_path"] = str(tmp_path / "log.jsonl")
+    raw["budget"]["usage_path"] = str(tmp_path / "usage.json")
     monkeypatch.setenv("INTERNAL_LLM_TOKEN", "internal-secret")
     up = Upstream()
     jev = FakeJev(raw["tiers"])
@@ -163,7 +165,7 @@ def test_keyword_rule_overrides_low_jev(env):
     c, up, jev, _ = env
     jev.next = "qwen3.8-27b"
     r = post(c, msgs_user("RTL 코드를 분석한 뒤 새롭게 구성해줘"))
-    assert r.headers["x-claude-auto-tier"] == "opus"
+    assert r.headers["x-claude-auto-tier"] == "sonnet"                # rule floor (budget-friendly default)
     r = post(c, msgs_user("make it shortly"), sid="s2")              # 'rtl' inside a word: no match
     assert r.headers["x-claude-auto-tier"] == "qwen3.8-27b"
 
@@ -328,6 +330,7 @@ def test_everything_busy_still_serves_least_loaded(env):
 def test_server_model_override(tmp_path, monkeypatch):
     raw = yaml.safe_load((ROOT / "proxy" / "config.example.yaml").read_text())
     raw["log_path"] = str(tmp_path / "log.jsonl")
+    raw["budget"]["usage_path"] = str(tmp_path / "usage.json")
     raw["backends"]["internal-27b"]["servers"] = [{"url": "http://jev27b.internal:8000",
                                                    "model": "autotrust/JEV-27B"}]
     up = Upstream()
@@ -346,14 +349,14 @@ def test_parse_metrics():
 
 
 # ------------------------------------------------------------------ budget
-def test_budget_tight_demotes_sonnet_class_only(env):
+def test_budget_tight_demotes_opus_only(env):
     c, up, jev, _ = env
     assert c.post("/budget", json={"level": "tight", "minutes": 10}).json()["level"] == "tight"
-    jev.next = "sonnet"
-    assert post(c, msgs_user("feature"), sid="b1").headers["x-claude-auto-tier"] == "qwen3.8-fn"
     jev.next = "opus"
-    assert post(c, msgs_user("architecture"), sid="b2").headers["x-claude-auto-tier"] == "opus"
-    assert post(c, msgs_user("x"), sid="b3", model="claude-tier-sonnet").headers["x-claude-auto-tier"] == "sonnet"
+    assert post(c, msgs_user("architecture"), sid="b1").headers["x-claude-auto-tier"] == "sonnet"
+    jev.next = "sonnet"
+    assert post(c, msgs_user("feature"), sid="b2").headers["x-claude-auto-tier"] == "sonnet"
+    assert post(c, msgs_user("x"), sid="b3", model="claude-tier-opus").headers["x-claude-auto-tier"] == "opus"
 
 
 def test_budget_tight_does_not_switch_running_prompt(env):
@@ -379,11 +382,11 @@ def test_budget_respects_context_size(env):
 
 def test_budget_from_ratelimit_headers(env):
     c, up, jev, _ = env
-    jev.next = "sonnet"
+    jev.next = "opus"
     up.extra_headers = {"anthropic-ratelimit-unified-status": "allowed_warning"}
-    post(c, msgs_user("feature"), sid="h1")
+    post(c, msgs_user("design"), sid="h1")
     assert c.get("/budget").json()["level"] == "tight"
-    assert post(c, msgs_user("feature 2"), sid="h2").headers["x-claude-auto-tier"] == "qwen3.8-fn"
+    assert post(c, msgs_user("design 2"), sid="h2").headers["x-claude-auto-tier"] == "sonnet"
 
 
 def test_budget_pacing():
@@ -395,3 +398,63 @@ def test_budget_pacing():
     assert b.level_from_payload({"remaining": 4000, "limit": 10000}, now)[0] == "tight"
     assert b.level_from_payload({"remaining": 300, "limit": 10000}, now)[0] == "critical"
     assert b.level_from_payload({"level": "tight"}, now)[0] == "tight"
+
+
+# ------------------------------------------------------------------ cost controls ($180/month policy)
+def test_fable_is_never_picked_automatically(env):
+    c, up, jev, _ = env
+    jev.next, jev.conf = "fable", 0.9
+    r = post(c, msgs_user("prove the protocol"))
+    assert r.headers["x-claude-auto-tier"] == "opus"
+    assert post(c, msgs_user("x"), sid="f2", model="claude-tier-fable").headers["x-claude-auto-tier"] == "fable"
+
+
+def test_opus_needs_confidence(env):
+    c, up, jev, _ = env
+    jev.next, jev.conf = "opus", 0.5          # P(>=opus) = 0.5 + 0.125 = 0.625 < 0.75
+    assert post(c, msgs_user("hmm"), sid="o1").headers["x-claude-auto-tier"] == "sonnet"
+    jev.conf = 0.8
+    assert post(c, msgs_user("hmm"), sid="o2").headers["x-claude-auto-tier"] == "opus"
+
+
+def test_low_conf_upgrade_stops_at_sonnet(env):
+    c, up, jev, _ = env
+    jev.next, jev.conf = "sonnet", 0.4
+    assert post(c, msgs_user("x")).headers["x-claude-auto-tier"] == "sonnet"
+
+
+def test_head_tail_keeps_the_request_at_the_end():
+    from jevtools.routing import head_tail
+    text = "코드:\n" + "x = 1\n" * 2000 + "위 코드를 멀티스레드로 바꿔줘"
+    out = head_tail(text, 2000)
+    assert len(out) <= 2000 and out.endswith("멀티스레드로 바꿔줘") and "[중략]" in out
+
+
+USAGE_SSE = (b'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":1000,'
+             b'"cache_creation_input_tokens":2000,"cache_read_input_tokens":100000,"output_tokens":1}}}\n\n'
+             b'event: message_delta\ndata: {"type":"message_delta","usage":{"output_tokens":3000}}\n\n'
+             b'event: message_stop\ndata: {"type":"message_stop"}\n\n')
+
+
+def test_usage_meter_prices_anthropic_responses(env):
+    c, up, jev, _ = env
+    up.sse = USAGE_SSE
+    jev.next = "sonnet"
+    r = post(c, msgs_user("feature"))
+    assert r.content == USAGE_SSE
+    u = c.get("/usage").json()
+    # sonnet: 1000*2 + 3000*10 + 2000*2.5 + 100000*0.2 = 57000 / 1e6
+    assert abs(u["spent_usd"] - 0.06) < 0.01 and u["by_model"]["claude-sonnet-5-5"]["requests"] == 1
+    jev.next = "qwen3.8-fn"
+    post(c, msgs_user("small"), sid="u2")                            # internal: not metered
+    assert c.get("/usage").json()["by_model"].keys() == {"claude-sonnet-5-5"}
+
+
+def test_local_spend_drives_budget_level(env):
+    c, up, jev, _ = env
+    c.post("/usage", json={"set_spent_usd": 179.5})                  # 99.7% of 180 used
+    assert c.get("/budget").json()["level"] == "critical"
+    jev.next = "sonnet"
+    assert post(c, msgs_user("feature")).headers["x-claude-auto-tier"] == "qwen3.8-fn"
+    c.post("/usage", json={"set_spent_usd": 0})
+    assert c.get("/budget").json()["level"] == "normal"
