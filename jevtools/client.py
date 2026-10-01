@@ -94,8 +94,9 @@ class JevClient:
     def decide(self, kind: str, state: str, question: str, options=None) -> dict:
         options, s, ids, payload = self.build(kind, state, question, options)
         try:
+            # JEV is an internal server: ignore http(s)_proxy env vars so the request goes direct
             r = httpx.post(f"{self.base_url}/v1/completions", json=payload,
-                           headers=self.headers, timeout=self.timeout)
+                           headers=self.headers, timeout=self.timeout, trust_env=False)
             r.raise_for_status()
         except httpx.HTTPError as e:
             raise JevError(str(e)) from e

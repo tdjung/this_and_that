@@ -60,6 +60,8 @@ class Backend:
         self.auth = cfg.get("auth", {"mode": "passthrough"})
         self.extra_headers = cfg.get("extra_headers", {}) or {}
         self.external = bool(cfg.get("external", name.startswith("anthropic")))
+        # use http(s)_proxy env vars for this backend? default: only for external backends
+        self.use_env_proxy = bool(cfg.get("use_env_proxy", self.external))
         self.metrics = bool(cfg.get("metrics", False))
         self.max_waiting = float(cfg.get("max_waiting", 4))
         self.metrics_ttl = float(cfg.get("metrics_ttl_s", 15))

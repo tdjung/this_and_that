@@ -46,6 +46,8 @@ jev:
 #          부하를 판단합니다. 모든 개발자가 각자 로컬 프록시를 쓰므로, 서버 지표가 있어야 다른 사람의
 #          부하까지 보입니다. /metrics가 막혀 있으면 false로 두세요(응답 429/503만으로 판단).
 # max_waiting: 대기열이 이 값을 넘는 서버는 '바쁨'으로 보고 다른 서버/overflow 티어로 보냅니다.
+# use_env_proxy: 셸의 http_proxy/https_proxy(사내 프록시)를 쓸지. 기본값은 external 백엔드만 true.
+#                내부 서버와 JEV 요청은 사내 프록시를 거치지 않고 직접 접속합니다.
 metrics_interval_s: 5
 
 backends:

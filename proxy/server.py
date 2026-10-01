@@ -91,7 +91,10 @@ class Router:
         self.last_request = 0.0
         self.log_path = Path(os.path.expanduser(raw.get("log_path", "~/.claude_auto/decisions.jsonl")))
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
-        self.client = httpx.AsyncClient(transport=transport, timeout=httpx.Timeout(600, connect=10))
+        timeout = httpx.Timeout(600, connect=10)
+        # external backends (Anthropic) honour http(s)_proxy env vars; internal servers and JEV go direct
+        self.client = httpx.AsyncClient(transport=transport, timeout=timeout, trust_env=True)
+        self.direct = httpx.AsyncClient(transport=transport, timeout=timeout, trust_env=False)
         if jev is not None:
             self.jev = jev
         else:
@@ -114,6 +117,9 @@ class Router:
             s = self.sessions[key] = Session()
         s.updated = now
         return s
+
+    def http_for(self, be: Backend) -> httpx.AsyncClient:
+        return self.client if be.use_env_proxy else self.direct
 
     def is_blocked(self, backend: str) -> bool:
         until = self.blocked.get(backend)
@@ -188,7 +194,7 @@ class Router:
             sess.tool_errors = sess.tool_errors + n_err if n_err else 0
 
         if new_prompt or sess.tier is None:
-            d: Decision = await classify_async(self.jev, self.client, self.cfg, user_prompts(messages))
+            d: Decision = await classify_async(self.jev, self.direct, self.cfg, user_prompts(messages))
             idx = d.tier
             info.update(kind="classified", reason=d.reason,
                         jev=self.names[d.jev_tier] if d.jev_tier is not None else None,
@@ -303,12 +309,13 @@ class Router:
             t, be, srv = queue.pop(0)
             tier = self.cfg.tiers[t]
             payload = json.dumps({**body, "model": srv.model or tier.model}, ensure_ascii=False)
-            req = self.client.build_request("POST", srv.url + path + query, content=payload.encode(),
+            http = self.http_for(be)
+            req = http.build_request("POST", srv.url + path + query, content=payload.encode(),
                                             headers=self.upstream_headers(request.headers, be))
             tried += 1
             srv.inflight += 1
             try:
-                resp = await self.client.send(req, stream=True)
+                resp = await http.send(req, stream=True)
             except httpx.TransportError as e:
                 srv.inflight -= 1
                 be.mark_down(srv)
@@ -381,7 +388,7 @@ class Router:
 
             async def one(be, s):
                 try:
-                    r = await self.client.get(s.url + "/metrics", timeout=2,
+                    r = await self.http_for(be).get(s.url + "/metrics", timeout=2,
                                               headers=self.upstream_headers({}, be))
                     if r.status_code == 200:
                         s.running, s.waiting = parse_metrics(r.text)
@@ -404,6 +411,7 @@ def create_app(raw: dict, transport=None, jev=None, background: bool = True) -> 
         for t in tasks:
             t.cancel()
         await router.client.aclose()
+        await router.direct.aclose()
 
     app = FastAPI(title="claude_auto proxy", lifespan=lifespan)
     app.state.router = router
@@ -423,7 +431,7 @@ def create_app(raw: dict, transport=None, jev=None, background: bool = True) -> 
         for t, be, srv in router.candidates(idx, sid)[:1]:
             payload = {**body, "model": srv.model or router.cfg.tiers[t].model}
             try:
-                r = await router.client.post(srv.url + "/v1/messages/count_tokens", json=payload,
+                r = await router.http_for(be).post(srv.url + "/v1/messages/count_tokens", json=payload,
                                              headers=router.upstream_headers(request.headers, be), timeout=15)
                 if r.status_code == 200:
                     return Response(r.content, media_type="application/json")

@@ -36,7 +36,7 @@ def main() -> int:
     failures = 0
 
     # 1. models
-    r = httpx.get(f"{a.url}/v1/models", headers=h, timeout=10)
+    r = httpx.get(f"{a.url}/v1/models", headers=h, timeout=10, trust_env=False)
     ids = [m["id"] for m in r.json().get("data", [])]
     good = "autotrust/JEV-27B" in ids and "jev-decision" in ids
     failures += not good
@@ -44,7 +44,7 @@ def main() -> int:
 
     # 2. System 2
     t = time.time()
-    r = httpx.post(f"{a.url}/v1/chat/completions", headers=h, timeout=120, json={
+    r = httpx.post(f"{a.url}/v1/chat/completions", headers=h, timeout=120, trust_env=False, json={
         "model": "autotrust/JEV-27B",
         "messages": [{"role": "user", "content": "In one sentence, what is safety stock?"}],
         "max_tokens": 60, "chat_template_kwargs": {"enable_thinking": False}})
