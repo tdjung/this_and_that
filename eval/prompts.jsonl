@@ -1,0 +1,30 @@
+{"id": "p01", "expected": "qwen3.8-27b", "lang": "ko", "prompt": "5*3이 뭐야?", "note": "사용자 예시"}
+{"id": "p02", "expected": "qwen3.8-27b", "lang": "ko", "prompt": "git에서 마지막 커밋 메시지만 수정하는 명령어 알려줘", "note": ""}
+{"id": "p03", "expected": "qwen3.8-27b", "lang": "en", "prompt": "What does HTTP status code 429 mean?", "note": ""}
+{"id": "p04", "expected": "qwen3.8-27b", "lang": "ko", "prompt": "이 문장 영어로 번역해줘: 배포는 금요일 오후에 하지 않는다", "note": ""}
+{"id": "p05", "expected": "qwen3.8-27b", "lang": "ko", "prompt": "파이썬에서 리스트를 역순으로 정렬하는 방법 알려줘", "note": ""}
+{"id": "p06", "expected": "qwen3.8-27b", "lang": "ko", "prompt": "회의록 정리 좀 해줘. 오늘 회의에서 김팀장이 다음 주 화요일까지 API 문서 초안을 공유하기로 했고, 박선임은 테스트 서버 증설 견적을 받아오기로 했어. 그리고 다음 회의는 목요일 오후 3시로 잡았고, 장소는 3층 회의실이야. 참석자는 김팀장, 박선임, 이책임, 나.", "note": "길지만 쉬운 요청"}
+{"id": "p07", "expected": "qwen3.8-fn", "lang": "ko", "prompt": "이 함수 디자인 패턴 사용하고 있어?", "note": "사용자 예시"}
+{"id": "p08", "expected": "qwen3.8-fn", "lang": "ko", "prompt": "src/utils/date.ts의 formatDate 함수에 대한 단위 테스트 추가해줘", "note": ""}
+{"id": "p09", "expected": "qwen3.8-fn", "lang": "en", "prompt": "Explain what the retry decorator in http_client.py does, line by line.", "note": ""}
+{"id": "p10", "expected": "qwen3.8-fn", "lang": "ko", "prompt": "config.py에서 DEFAULT_TIMEOUT을 30초에서 60초로 바꾸고 관련 주석도 수정해줘", "note": ""}
+{"id": "p11", "expected": "qwen3.8-fn", "lang": "ko", "prompt": "이 에러 의미가 뭐야? TypeError: 'NoneType' object is not subscriptable (parser.py:88)", "note": ""}
+{"id": "p12", "expected": "qwen3.8-fn", "lang": "en", "prompt": "Add debug logging to every branch of the handle_event function.", "note": ""}
+{"id": "p13", "expected": "sonnet", "lang": "ko", "prompt": "사용자 프로필 API에 프로필 이미지 업로드 기능을 추가해줘. 컨트롤러, 서비스, 스토리지 레이어를 다 수정해야 해", "note": ""}
+{"id": "p14", "expected": "sonnet", "lang": "ko", "prompt": "CI에서만 integration test가 간헐적으로 실패해. 원인 찾아서 고쳐줘", "note": ""}
+{"id": "p15", "expected": "sonnet", "lang": "en", "prompt": "Migrate our logging from print statements to the structlog library across the services/ directory.", "note": ""}
+{"id": "p16", "expected": "sonnet", "lang": "ko", "prompt": "REST 클라이언트를 사내 결제 API 신규 스펙(v3)에 맞춰 수정해줘. 문서는 docs/payment_v3.md에 있어", "note": ""}
+{"id": "p17", "expected": "sonnet", "lang": "en", "prompt": "Refactor the CLI argument parsing into a separate module and update all commands to use it.", "note": ""}
+{"id": "p18", "expected": "sonnet", "lang": "ko", "prompt": "pytest 커버리지 리포트 보고 커버리지 낮은 모듈들 테스트 보강해줘", "note": ""}
+{"id": "p19", "expected": "opus", "lang": "ko", "prompt": "RTL 코드를 분석한 뒤 새롭게 구성해줘", "note": "사용자 예시, 짧지만 어려운 요청"}
+{"id": "p20", "expected": "opus", "lang": "ko", "prompt": "이 AXI 인터커넥트 모듈(rtl/axi_xbar.sv)의 타이밍 위반 원인을 분석하고 파이프라인 구조를 재설계해줘", "note": ""}
+{"id": "p21", "expected": "opus", "lang": "en", "prompt": "Design the architecture for splitting our monolith's order service into event-driven microservices, including the data consistency strategy.", "note": ""}
+{"id": "p22", "expected": "opus", "lang": "ko", "prompt": "멀티스레드 캐시에서 가끔 데드락이 나. lock 획득 순서를 분석해서 근본적으로 해결해줘", "note": ""}
+{"id": "p23", "expected": "opus", "lang": "en", "prompt": "Our p99 latency doubled after the last release. Profile the hot paths, then propose and implement optimizations.", "note": ""}
+{"id": "p24", "expected": "opus", "lang": "ko", "prompt": "인증 모듈을 세션 기반에서 OAuth2 + PKCE로 전환하는 설계와 구현 계획을 세워줘", "note": ""}
+{"id": "p25", "expected": "fable", "lang": "ko", "prompt": "새로운 캐시 일관성 프로토콜을 설계하고 safety와 liveness를 형식적으로 증명해줘", "note": ""}
+{"id": "p26", "expected": "fable", "lang": "en", "prompt": "Find the root cause of a data corruption bug that appears only under heavy load across our Kafka consumers, Postgres replication and the Redis cache layer. It reproduces about once every few days.", "note": ""}
+{"id": "p27", "expected": "fable", "lang": "ko", "prompt": "약 50만 줄짜리 전체 코드베이스를 Python 2에서 Python 3로 단계적으로 마이그레이션하는 전략을 세우고 첫 단계를 구현해줘", "note": ""}
+{"id": "p28", "expected": "fable", "lang": "en", "prompt": "Design a lock-free concurrent B+tree for our storage engine and implement it with a correctness argument for each operation.", "note": ""}
+{"id": "p29", "expected": "fable", "lang": "ko", "prompt": "RISC-V 코어의 out-of-order 실행 파이프라인을 처음부터 설계하고 SystemVerilog로 구현해줘", "note": ""}
+{"id": "p30", "expected": "fable", "lang": "ko", "prompt": "우리 분산 스케줄러의 공정성 알고리즘을 새로 고안하고, 시뮬레이션으로 기존 방식 대비 성능을 검증해줘", "note": ""}

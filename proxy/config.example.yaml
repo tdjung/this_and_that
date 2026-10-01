@@ -1,0 +1,136 @@
+# claude_auto 로컬 라우팅 프록시 설정 예시
+# 복사해서 사용: mkdir -p ~/.claude_auto && cp proxy/config.example.yaml ~/.claude_auto/config.yaml
+# 표시된 "# TODO" 항목은 사내 환경 값으로 바꿔야 합니다.
+
+listen:
+  host: 127.0.0.1          # 로컬에서만 접근 (인증 없음)
+  port: 8787
+
+# Claude Code → 프록시 인증 방식 (claude_auto 런처가 사용)
+#   claude_login : Claude Code의 claude.ai(엔터프라이즈) 로그인을 그대로 보냄.
+#                  anthropic 백엔드는 auth.mode: passthrough 로 두면 기존 좌석 과금으로 처리됨
+#   token        : 로컬용 임의 토큰을 보냄 (ANTHROPIC_AUTH_TOKEN). 이 경우 anthropic 백엔드는
+#                  api_key/bearer 모드로 실제 키를 프록시가 붙여야 함
+client_auth: claude_login
+
+# route  : 분류 결과대로 라우팅
+# shadow : 분류만 하고 로그에 남기며, 실제로는 shadow_tier로 보냄 (도입 1단계용)
+mode: route
+shadow_tier: sonnet
+
+log_path: ~/.claude_auto/decisions.jsonl
+
+# ------------------------------------------------------------------ JEV 분류기
+jev:
+  base_url: http://jev-host.internal:8000      # TODO: serve_jev27b.sh로 띄운 vLLM 주소
+  model_dir: /models/JEV-27B                   # TODO: decision_head.json, calibration.json이 있는 경로
+  adapter: jev-decision
+  api_key_env: JEV_API_KEY                     # vLLM을 --api-key로 띄웠다면 그 값을 담은 환경변수 이름
+  timeout_s: 3.0
+  confidence_threshold: 0.55   # 최상위 확률이 이보다 낮으면 한 단계 위로
+  fallback_tier: qwen3.8-fn    # JEV 장애 시 사용할 티어
+  max_state_chars: 2000        # 분류기에 넣을 최대 글자 수 (JEV 입력 상한 1024토큰 고려)
+  context_turns: 2             # 함께 넣을 이전 사용자 메시지 수
+
+# ------------------------------------------------------------------ 백엔드
+# auth.mode:
+#   passthrough : Claude Code가 보낸 Authorization / x-api-key를 그대로 전달
+#                 (claude.ai 엔터프라이즈 로그인으로 Anthropic을 쓰는 경우)
+#   bearer      : Authorization: Bearer $<env>
+#   api_key     : x-api-key: $<env>
+#   none        : 인증 헤더 없음
+backends:
+  internal-27b:
+    base_url: http://qwen27b.internal:8000      # TODO: Anthropic /v1/messages 호환 엔드포인트
+    auth: {mode: bearer, env: INTERNAL_LLM_TOKEN}
+  internal-fn:
+    base_url: http://qwen-fn.internal:8000      # TODO
+    auth: {mode: bearer, env: INTERNAL_LLM_TOKEN}
+  anthropic:
+    base_url: https://api.anthropic.com         # TODO: 사내 외부모델 게이트웨이 주소라면 그 주소
+    auth: {mode: passthrough}
+    # 추가 헤더가 필요하면:
+    # extra_headers: {x-team-id: my-team}
+
+# ------------------------------------------------------------------ 티어 (낮은 → 높은 순서)
+# criteria는 JEV의 choice 선택지로 그대로 들어갑니다. JEV-27B는 영어 코퍼스로 학습되어 영어로 작성합니다.
+tiers:
+  - name: qwen3.8-27b
+    backend: internal-27b
+    model: qwen3.8-27b                           # TODO: 백엔드가 기대하는 모델 이름
+    max_context: 131072                          # TODO: 실제 서빙 컨텍스트 길이
+    criteria: >-
+      A simple question that needs no repository context: general knowledge, arithmetic,
+      a command or syntax lookup, translating or rewording text, or a tiny standalone snippet.
+  - name: qwen3.8-fn
+    backend: internal-fn
+    model: qwen3.8-flash-next                    # TODO
+    max_context: 131072                          # TODO
+    criteria: >-
+      Reading and explaining existing code, or a small localized change in one or two files:
+      explain a function, add a unit test, fix an obvious bug, rename, add logging, write a short script.
+  - name: sonnet
+    backend: anthropic
+    model: claude-sonnet-5-5                     # TODO: 게이트웨이에서 쓰는 정확한 모델 ID
+    max_context: 200000
+    criteria: >-
+      A multi-step coding task across several files: implement a feature end to end, debug a
+      non-obvious failure that needs investigation, a moderate refactor, or integrate an unfamiliar API.
+  - name: opus
+    backend: anthropic
+    model: claude-opus-5-5
+    max_context: 200000
+    criteria: >-
+      Deep design or reasoning: system or module architecture, large refactors, concurrency bugs,
+      performance tuning, hardware RTL design analysis and restructuring, or security-sensitive changes.
+  - name: fable
+    backend: anthropic
+    model: claude-fable-5-1
+    max_context: 200000
+    criteria: >-
+      Exceptionally hard, long-horizon or high-stakes work: novel algorithms or research-level problems,
+      root-causing rare failures that span several systems, redesigning a very large codebase end to end,
+      or producing formal correctness arguments.
+
+# ------------------------------------------------------------------ 룰 (상향 전용)
+rules:
+  keywords:
+    - min_tier: opus
+      keywords: [rtl, verilog, systemverilog, vhdl, "타이밍 위반", "timing violation", deadlock, "데드락"]
+    - min_tier: sonnet
+      keywords: ["아키텍처", architecture, "전체 리팩토링", migration, "마이그레이션"]
+  extensions:
+    - min_tier: opus
+      extensions: [sv, svh, v, vh, vhd, vhdl]
+
+# ------------------------------------------------------------------ 요청 종류별 처리
+# Claude Code가 보내는 x-claude-code-request-class 헤더 값 기준.
+#   route   : 분류해서 결정 (세션 고정 정책 적용)
+#   session : 세션에 현재 고정된 티어를 그대로 사용 (없으면 가장 낮은 티어)
+#   <티어명> : 항상 그 티어
+request_classes:
+  main: route
+  subagent: route        # 서브에이전트마다 별도 하위 세션으로 분류
+  workflow: route
+  compaction: session    # 요약은 현재 모델로 (컨텍스트가 크면 아래 context-fit 규칙으로 자동 상향)
+  auxiliary: qwen3.8-27b # 세션 제목, 요약 등 부가 요청
+
+# 서브에이전트 타입별 고정 티어 (x-claude-code-agent-type)
+agent_types:
+  Explore: qwen3.8-fn
+
+# ------------------------------------------------------------------ 세션 정책
+session:
+  # upgrade_only : 한 세션에서 티어는 올라가기만 함 (모델 전환에 따른 캐시 손실 최소화)
+  # free         : 새 프롬프트마다 다시 분류한 결과를 그대로 사용
+  policy: upgrade_only
+  reset_on_compaction: true    # 컴팩션 직후에는 캐시가 어차피 사라지므로 다시 내려갈 수 있게 함
+  ttl_minutes: 720
+
+# ------------------------------------------------------------------ 실패/한도 대응
+fallback:
+  escalate_on_tool_errors: 3        # 연속 도구 에러가 이만큼 쌓이면 한 단계 상향 (0이면 끔)
+  escalate_on_backend_error: true   # 내부 백엔드 연결 실패/5xx면 다음 티어로 재시도
+  downgrade_on_quota: true          # Anthropic 쪽 사용량 한도(429)면 가장 높은 내부 티어로 하향
+  quota_min_retry_after_s: 60       # retry-after가 이 값 이상이거나 없으면 '한도 소진'으로 판단
+  quota_cooldown_minutes: 30        # 한도 소진으로 판단된 백엔드를 건너뛰는 시간

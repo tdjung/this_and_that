@@ -1,0 +1,126 @@
+#!/usr/bin/env bash
+# claude_auto — 로컬 라우팅 프록시를 띄우고(이미 떠 있으면 재사용) 그 프록시를 거쳐 Claude Code를 실행합니다.
+#
+#   claude_auto                 # 평소 claude 대신 사용. 인자는 claude에 그대로 전달
+#   claude_auto -p "질문"        # 예: 비대화형 실행
+#
+# 동작:
+#   1. ~/.claude_auto/config.yaml 의 listen 주소로 프록시 상태를 확인하고, 없으면 백그라운드로 기동
+#   2. --settings 로 ANTHROPIC_BASE_URL 과 모델 별칭(claude-auto 등)을 이 세션에만 주입
+#      (평소의 `claude` 실행과 ~/.claude/settings.json 은 건드리지 않음)
+#   3. Claude Code가 끝나면, 이 런처가 띄운 프록시를 쓰는 claude_auto 세션이 하나도 없을 때 프록시를 종료
+#
+# 환경변수:
+#   CLAUDE_AUTO_HOME        상태 디렉터리 (기본 ~/.claude_auto)
+#   CLAUDE_AUTO_CONFIG      설정 파일 (기본 $CLAUDE_AUTO_HOME/config.yaml)
+#   CLAUDE_AUTO_PYTHON      프록시를 실행할 파이썬 (기본 python3, venv 경로 지정 가능)
+#   CLAUDE_AUTO_KEEP_PROXY  1이면 마지막 세션이 끝나도 프록시를 유지
+#   CLAUDE_BIN              claude 실행 파일 (기본 claude)
+set -uo pipefail
+
+ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+STATE="${CLAUDE_AUTO_HOME:-$HOME/.claude_auto}"
+CONF="${CLAUDE_AUTO_CONFIG:-$STATE/config.yaml}"
+PY="${CLAUDE_AUTO_PYTHON:-python3}"
+CLAUDE_BIN="${CLAUDE_BIN:-claude}"
+mkdir -p "$STATE/sessions"
+
+die() { echo "claude_auto: $*" >&2; exit 1; }
+
+[[ -f "$CONF" ]] || die "설정 파일이 없습니다: $CONF
+  cp $ROOT/proxy/config.example.yaml $CONF  후 TODO 항목을 수정하세요."
+command -v "$CLAUDE_BIN" >/dev/null || die "claude 실행 파일을 찾을 수 없습니다 ($CLAUDE_BIN)"
+"$PY" -c "import fastapi, uvicorn, httpx, yaml" 2>/dev/null \
+  || die "프록시 의존성이 없습니다: $PY -m pip install -r $ROOT/requirements.txt"
+
+read -r HOST PORT CLIENT_AUTH < <("$PY" - "$CONF" <<'EOF'
+import sys, yaml
+c = yaml.safe_load(open(sys.argv[1])) or {}
+l = c.get("listen", {})
+print(l.get("host", "127.0.0.1"), l.get("port", 8787), c.get("client_auth", "claude_login"))
+EOF
+)
+[[ "$HOST" == "0.0.0.0" ]] && HOST=127.0.0.1
+BASE="http://$HOST:$PORT"
+
+healthy() { "$PY" - "$BASE/health" <<'EOF' >/dev/null 2>&1
+import sys, urllib.request
+urllib.request.urlopen(sys.argv[1], timeout=1).read()
+EOF
+}
+
+# ---- 프록시 기동 (동시에 두 개를 띄우지 않도록 잠금)
+start_proxy() {
+  if healthy; then return 0; fi
+  echo "claude_auto: 라우팅 프록시 시작 ($BASE, 로그: $STATE/proxy.log)" >&2
+  nohup "$PY" "$ROOT/proxy/server.py" --config "$CONF" >>"$STATE/proxy.log" 2>&1 &
+  echo $! >"$STATE/proxy.pid"
+  for _ in $(seq 1 40); do
+    healthy && return 0
+    kill -0 "$(cat "$STATE/proxy.pid")" 2>/dev/null || break
+    sleep 0.5
+  done
+  tail -n 20 "$STATE/proxy.log" >&2
+  die "프록시가 시작되지 않았습니다."
+}
+if command -v flock >/dev/null; then
+  exec 9>"$STATE/start.lock"; flock 9; start_proxy; flock -u 9
+else
+  start_proxy
+fi
+
+# ---- 세션 등록 / 정리
+touch "$STATE/sessions/$$"
+cleanup() {
+  rm -f "$STATE/sessions/$$"
+  for f in "$STATE"/sessions/*; do
+    [[ -e "$f" ]] || continue
+    kill -0 "$(basename "$f")" 2>/dev/null || rm -f "$f"
+  done
+  if [[ "${CLAUDE_AUTO_KEEP_PROXY:-0}" != "1" && -f "$STATE/proxy.pid" ]] \
+     && [[ -z "$(ls -A "$STATE/sessions" 2>/dev/null)" ]]; then
+    kill "$(cat "$STATE/proxy.pid")" 2>/dev/null && echo "claude_auto: 프록시 종료" >&2
+    rm -f "$STATE/proxy.pid"
+  fi
+}
+trap cleanup EXIT
+trap 'exit 130' INT TERM
+
+# ---- 이 세션 전용 설정
+ENV_JSON=$("$PY" - "$BASE" "$CLIENT_AUTH" <<'EOF'
+import json, sys
+base, auth = sys.argv[1], sys.argv[2]
+env = {
+    "ANTHROPIC_BASE_URL": base,
+    "ANTHROPIC_MODEL": "claude-auto",                    # 기본: 프록시가 자동 라우팅
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "claude-auto",     # /model sonnet → 자동 라우팅으로 복귀
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "claude-auto",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "claude-tier-opus",  # /model opus  → Opus 강제
+}
+if auth == "token":
+    env["ANTHROPIC_AUTH_TOKEN"] = "claude-auto-local"
+print(json.dumps({"env": env}))
+EOF
+)
+
+if [[ "$CLIENT_AUTH" == "claude_login" ]]; then
+  # 로그인 대신 키가 쓰이면 엔터프라이즈 좌석이 아니라 그 키로 과금되므로 경고
+  if [[ -n "${ANTHROPIC_API_KEY:-}${ANTHROPIC_AUTH_TOKEN:-}" ]]; then
+    echo "claude_auto: 경고 - ANTHROPIC_API_KEY/ANTHROPIC_AUTH_TOKEN 이 설정되어 있어 claude.ai 로그인 대신 사용됩니다." >&2
+  fi
+  "$PY" - <<'EOF' >&2
+import json, os
+p = os.path.expanduser("~/.claude/settings.json")
+try:
+    env = json.load(open(p)).get("env", {})
+except Exception:
+    env = {}
+hit = [k for k in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN") if k in env]
+if hit or "apiKeyHelper" in (json.load(open(p)) if os.path.exists(p) else {}):
+    print(f"claude_auto: 경고 - {p} 에 {hit or ['apiKeyHelper']} 가 있어 claude.ai 로그인 대신 사용됩니다. "
+          "내부 서버용 토큰이라면 프록시 config의 backends.*.auth 로 옮기세요.")
+EOF
+fi
+
+"$CLAUDE_BIN" --settings "$ENV_JSON" "$@"
+exit $?
