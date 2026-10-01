@@ -30,6 +30,7 @@ def main() -> int:
     ap.add_argument("--url", default="http://localhost:8000")
     ap.add_argument("--model-dir", default="./JEV-27B")
     ap.add_argument("--api-key", default=None)
+    ap.add_argument("--served-name", default="autotrust/JEV-27B", help="vLLM --served-model-name 값")
     ap.add_argument("--latency-runs", type=int, default=10)
     a = ap.parse_args()
     h = {"Authorization": f"Bearer {a.api_key}"} if a.api_key else {}
@@ -38,14 +39,14 @@ def main() -> int:
     # 1. models
     r = httpx.get(f"{a.url}/v1/models", headers=h, timeout=10, trust_env=False)
     ids = [m["id"] for m in r.json().get("data", [])]
-    good = "autotrust/JEV-27B" in ids and "jev-decision" in ids
+    good = a.served_name in ids and "jev-decision" in ids
     failures += not good
     print(f"[1] /v1/models -> {ids}  {OK if good else FAIL}")
 
     # 2. System 2
     t = time.time()
     r = httpx.post(f"{a.url}/v1/chat/completions", headers=h, timeout=120, trust_env=False, json={
-        "model": "autotrust/JEV-27B",
+        "model": a.served_name,
         "messages": [{"role": "user", "content": "In one sentence, what is safety stock?"}],
         "max_tokens": 60, "chat_template_kwargs": {"enable_thinking": False}})
     text = r.json()["choices"][0]["message"]["content"] if r.status_code == 200 else r.text
