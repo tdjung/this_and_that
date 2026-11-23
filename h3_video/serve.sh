@@ -2,6 +2,7 @@
 # MiniMax-H3 (FL2VA: 텍스트→영상, 첫 프레임→영상)를 vLLM-Omni docker로 서빙합니다. (L40S 48GB 서버 기준)
 #
 # 사용법:
+#   bash serve.sh check      # 빌드 전에: 기반 이미지(CUDA 13)가 이 서버 드라이버에서 GPU를 쓰는지 확인
 #   bash serve.sh setup      # 최초 1회: vLLM-Omni 최신 소스를 받고 docker 이미지 빌드 (vLLM 버전까지 맞춘 이미지)
 #   bash serve.sh start      # 컨테이너 시작 후 준비될 때까지 대기 (기본 동작)
 #   bash serve.sh stop       # 컨테이너 중지·삭제
@@ -154,6 +155,21 @@ case "$ACTION" in
     echo ">> 이미지 빌드: $IMAGE (vllm/vllm-openai 기반, LMCache 컴파일 포함이라 수십 분 걸릴 수 있음)"
     run docker build -f "$OMNI_SRC/docker/Dockerfile.cuda" -t "$IMAGE" "$OMNI_SRC"
     ;;
+  check)
+    # 호스트 드라이버가 CUDA 12.x(R535 등)여도, 데이터센터 GPU(L40S 등)는 이미지 안의 forward compatibility
+    # 라이브러리로 CUDA 13 이미지를 실행할 수 있습니다. 빌드(수십 분) 전에 기반 이미지로 먼저 확인합니다.
+    CHECK_IMAGE="${CHECK_IMAGE:-vllm/vllm-openai:v0.34.0}"
+    echo ">> $CHECK_IMAGE 로 GPU ${_gpu_list[0]} 확인"
+    run docker run --rm --gpus "\"device=${_gpu_list[0]}\"" --entrypoint bash "$CHECK_IMAGE" -c '
+      ls -d /usr/local/cuda*/compat 2>/dev/null | sed "s/^/compat: /"
+      python3 -c "
+import torch
+print(\"torch\", torch.__version__, \"| CUDA runtime\", torch.version.cuda)
+assert torch.cuda.is_available(), \"GPU를 쓸 수 없음 (드라이버/compat 문제)\"
+x = torch.randn(2048, 2048, device=\"cuda\")
+print(\"GPU:\", torch.cuda.get_device_name(0), \"| matmul OK:\", float((x @ x).sum()) == float((x @ x).sum()))
+"'
+    ;;
   start)   docker_start ;;
   stop)    run docker rm -f "$NAME" ;;
   restart) run docker rm -f "$NAME" >/dev/null 2>&1 || true; docker_start ;;
@@ -166,5 +182,5 @@ case "$ACTION" in
       echo "health: (응답 없음)"
     fi
     ;;
-  *) die "알 수 없는 동작: $ACTION (setup|start|stop|restart|status|logs)" ;;
+  *) die "알 수 없는 동작: $ACTION (check|setup|start|stop|restart|status|logs)" ;;
 esac
