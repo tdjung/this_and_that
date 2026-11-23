@@ -11,7 +11,7 @@
 # 첫 프레임 이미지는 이 PC에서 업로드돼요. 서버 쪽 경로를 맞출 필요 없어요.
 set -euo pipefail
 
-HOST="${H3_HOST:-http://127.0.0.1:8000}"
+HOST="${H3_HOST:-http://127.0.0.1:19300}"   # serve.sh의 HOST_PORT와 맞추기
 PROMPT_FILE="$1"
 NAME="$2"
 FRAME="${3:-}"

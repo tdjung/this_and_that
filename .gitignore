@@ -3,3 +3,6 @@ __pycache__/
 .pytest_cache/
 jev/eval/results/
 JEV-27B/
+h3_video/vllm-omni/
+h3_video/out/
+h3_video/frames/
