@@ -1,0 +1,8 @@
+Continue from the given first frame. Keep the same person, desk, office, lighting and outfit exactly as in the frame.
+0-2s: the engineer leans back calmly with the coffee mug, watching several windows on the monitors update on their own, panels scrolling and progress bars filling.
+2-4s: they put the mug down, lean in and study one screen closely.
+4-5s: a small satisfied nod, then a single click of the mouse.
+Camera: slow orbit from behind the shoulder toward the side of the desk.
+Lighting and style: warm amber afternoon sunlight. 35mm film look, soft film grain. Screen content stays blurred and unreadable.
+Audio: quiet office ambience, the soft sound of the mug set on the desk, one clear mouse click. No music, no speech.
+No text, no logos.

@@ -1,7 +1,7 @@
 # claude_auto 프로젝트 인수인계 (2026-10-01)
 
 폐쇄망 환경에서 논의를 이어가기 위한 정리입니다. 이 문서만 보고도 맥락을 파악할 수 있게 썼습니다.
-코드 저장소: `github.com/tdjung/this_and_that` (README.md에 사용법 상세)
+코드 저장소: `github.com/tdjung/this_and_that`의 `jev/` 폴더 (`jev/README.md`에 사용법 상세)
 
 ---
 

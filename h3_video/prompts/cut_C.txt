@@ -1,0 +1,8 @@
+Continue from the given first frame. Keep the same three people, room, whiteboard and lighting exactly as in the frame.
+0-2s: the engineer in the dark grey hoodie draws a new box and an arrow on the whiteboard with the marker.
+2-4s: a colleague points at part of the diagram; the engineer turns slightly toward them, listening.
+4-5s: both look back at the board and the engineer adds one more arrow.
+Camera: subtle handheld movement, shallow depth of field, focus on the marker tip and the drawn lines.
+Lighting and style: warm natural daylight. 35mm film look, soft film grain. The drawing stays abstract boxes and arrows with no readable words.
+Audio: marker squeaking on the whiteboard, low murmured conversation with no clear words. No music.
+No text, no logos.

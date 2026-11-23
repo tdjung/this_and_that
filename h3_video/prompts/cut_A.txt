@@ -1,0 +1,8 @@
+Continue from the given first frame. Keep the same person, desk, office, lighting and camera angle exactly as in the frame.
+0-2s: the engineer types fast on the keyboard, shoulders tense, leaning toward the monitor.
+2-4s: they stop typing, lean back slightly and rub their eyes with one hand, tired.
+4-5s: they lean forward again toward the monitor and put both hands back on the keyboard.
+Camera: slow, steady push-in toward the monitor over the shoulder.
+Lighting and style: stays cold blue-teal monitor light only; the rest of the office stays dark. 35mm film look, soft film grain, muted teal color grade. Screen content stays blurred and unreadable.
+Audio: fast continuous keyboard typing that stops when they rub their eyes, then starts again; constant low air-conditioning hum. No music, no speech.
+No text, no logos.

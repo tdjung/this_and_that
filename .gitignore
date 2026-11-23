@@ -1,5 +1,5 @@
 __pycache__/
 *.pyc
 .pytest_cache/
-eval/results/
+jev/eval/results/
 JEV-27B/
