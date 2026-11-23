@@ -16,7 +16,7 @@
 # 1. 모델 다운로드 (Hugging Face 모델 페이지에서 접근 승인 필요). 루트 폴더 전체를 받음
 hf download MiniMaxAI/MiniMax-H3 --local-dir /data/models/MiniMax-H3
 
-# 2. 최초 1회: vLLM-Omni 최신 소스 + docker 이미지 받기
+# 2. 최초 1회: vLLM-Omni 최신 소스를 받고, vLLM 버전까지 맞춘 docker 이미지 빌드 (수십 분)
 bash serve.sh setup
 
 # 3. 서버 실행 (GPU 0~3, 텐서 병렬 4, 호스트 포트 19300)
@@ -48,7 +48,8 @@ mkdir -p frames && ffmpeg -ss 2 -i out/key_A_s42.mp4 -frames:v 1 frames/key_A.pn
 
 ## 주의
 
-- `vllm/vllm-omni:minimax-h3` 이미지는 H3 모듈형 파이프라인보다 오래된 태그라서, 공식 레시피처럼 최신 vLLM-Omni 소스를 마운트하고 `PYTHONPATH` 앞에 둬서 덮어씁니다 (`setup`이 소스를 받음).
+- 이미지는 vLLM-Omni 저장소의 `docker/Dockerfile.cuda`로 직접 빌드합니다 (`vllm-omni-h3:local`). vLLM-Omni 소스와 vLLM 버전이 짝이 맞아야 해서, 오래된 `vllm/vllm-omni:minimax-h3` 이미지에 최신 소스만 마운트하면 `compute_mm_prefix_ranges` 같은 vLLM API 불일치 에러가 납니다. 빌드 대신 Docker Hub의 `vllm/vllm-omni:nightly-<커밋>` 이미지를 `IMAGE=`로 지정해도 됩니다.
+- 빌드되는 이미지는 CUDA 13 기반이라 호스트 NVIDIA 드라이버가 CUDA 13을 지원해야 합니다 (`nvidia-smi` 오른쪽 위 `CUDA Version`이 13.x 이상).
 - 공식 레시피에 L40S 전용 프로필은 없습니다. `l40s` 프로필은 RTX 5090 프로필의 텐서 병렬 방식을 48GB × 4장에 맞춘 설정이라 처음 실행 때 조정이 필요할 수 있습니다.
 - 로컬 버전은 프롬프트 보정(H3-Context-IR)과 2K 변환이 없어서 출력은 768p(1344×768)입니다. 업스케일은 남는 GPU 4장에서 SeedVR2로 하고, 필름 그레인은 업스케일 뒤에 입힙니다.
 - 첫 프레임 필드 이름(`input_reference`)은 레시피에 명시돼 있지 않아 추정값입니다. 첫 결과에서 키프레임이 유지되는지 꼭 확인하세요.

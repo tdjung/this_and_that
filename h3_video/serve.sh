@@ -2,7 +2,7 @@
 # MiniMax-H3 (FL2VA: 텍스트→영상, 첫 프레임→영상)를 vLLM-Omni docker로 서빙합니다. (L40S 48GB 서버 기준)
 #
 # 사용법:
-#   bash serve.sh setup      # 최초 1회: vLLM-Omni 최신 소스 받기 (이미지의 패키지를 덮어씀)
+#   bash serve.sh setup      # 최초 1회: vLLM-Omni 최신 소스를 받고 docker 이미지 빌드 (vLLM 버전까지 맞춘 이미지)
 #   bash serve.sh start      # 컨테이너 시작 후 준비될 때까지 대기 (기본 동작)
 #   bash serve.sh stop       # 컨테이너 중지·삭제
 #   bash serve.sh restart
@@ -17,10 +17,12 @@
 #
 # 환경변수 (기본값):
 #   MODEL_DIR=              # 필수. hf download로 받은 MiniMax-H3 "루트" 폴더 (FL2VA 하위 폴더 아님)
-#   OMNI_SRC=./vllm-omni    # vLLM-Omni 소스 위치 (setup이 여기에 받음)
-#   IMAGE=vllm/vllm-omni:minimax-h3
-#                           # 이 태그는 H3 모듈형 파이프라인(vLLM-Omni #5720)보다 오래돼서,
-#                           # OMNI_SRC를 마운트하고 PYTHONPATH 앞에 둬서 최신 소스로 덮어씁니다 (공식 레시피 방식).
+#   OMNI_SRC=./vllm-omni    # vLLM-Omni 소스 위치 (setup이 여기에 받고 이미지를 빌드)
+#   IMAGE=vllm-omni-h3:local
+#                           # setup이 vLLM-Omni 저장소의 docker/Dockerfile.cuda로 빌드하는 이미지.
+#                           # 소스와 vLLM 버전이 짝이 맞아야 해서, 최신 소스만 마운트하는 방식은 쓰지 않습니다
+#                           # (vllm/vllm-omni:minimax-h3 + 최신 소스 마운트 → vLLM API 불일치 에러).
+#                           # Docker Hub의 vllm/vllm-omni:nightly-<커밋> 이미지를 지정해도 됩니다.
 #   NAME=minimax-h3-fl2va   # 컨테이너 이름
 #   GPUS=0,1,2,3            # --gpus '"device=..."' 에 들어갈 GPU 번호
 #   HOST_PORT=19300         # 호스트 포트 (컨테이너 안은 항상 8000). 기존 8000/8001 서버와 겹치지 않게
@@ -40,7 +42,7 @@ set -euo pipefail
 ACTION="${1:-start}"
 MODEL_DIR="${MODEL_DIR:-}"
 OMNI_SRC="${OMNI_SRC:-./vllm-omni}"
-IMAGE="${IMAGE:-vllm/vllm-omni:minimax-h3}"
+IMAGE="${IMAGE:-vllm-omni-h3:local}"
 NAME="${NAME:-minimax-h3-fl2va}"
 GPUS="${GPUS:-0,1,2,3}"
 HOST_PORT="${HOST_PORT:-19300}"
@@ -61,7 +63,9 @@ check_inputs() {
   [[ -d "$MODEL_DIR" ]] || die "모델 폴더가 없습니다: $MODEL_DIR"
   [[ -f "$MODEL_DIR/model_index.json" && -d "$MODEL_DIR/FL2VA" ]] \
     || die "루트 폴더가 아닌 것 같습니다 (model_index.json, FL2VA/ 필요): $MODEL_DIR"
-  [[ -d "$OMNI_SRC/vllm_omni" ]] || die "vLLM-Omni 소스가 없습니다: $OMNI_SRC  ('bash $0 setup' 먼저 실행)"
+  if [[ "$DRY_RUN" != "1" ]] && ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+    die "이미지가 없습니다: $IMAGE  ('bash $0 setup'으로 빌드하거나 IMAGE=... 지정)"
+  fi
 }
 
 # vllm serve 인자 (컨테이너 안 경로 기준)
@@ -114,9 +118,8 @@ docker_start() {
   if docker ps -a -q -f "name=^${NAME}$" | grep -q . && [[ "$DRY_RUN" != "1" ]]; then
     die "같은 이름의 컨테이너가 이미 있습니다: $NAME  ('bash $0 restart' 또는 NAME=... 지정)"
   fi
-  local abs_model abs_src
+  local abs_model
   abs_model="$(cd "$MODEL_DIR" && pwd)"
-  abs_src="$(cd "$OMNI_SRC" && pwd)"
   vllm_args
   local DOCKER_ARGS=(
     run -d
@@ -125,8 +128,6 @@ docker_start() {
     --ipc=host
     --name "$NAME"
     -v "${abs_model}:/models/MiniMax-H3:ro"
-    -v "${abs_src}:/opt/vllm-omni:ro"
-    -e PYTHONPATH=/opt/vllm-omni              # 최신 vLLM-Omni 소스를 이미지 패키지보다 먼저 사용
     -e VLLM_WORKER_MULTIPROC_METHOD=spawn
     -e VLLM_OMNI_VIDEO_SYNC_TIMEOUT=14400     # 긴 생성이 타임아웃 나지 않게
     -e FLASHINFER_DISABLE_VERSION_CHECK=1
@@ -136,7 +137,7 @@ docker_start() {
   [[ -n "$RESTART" ]] && DOCKER_ARGS+=(--restart "$RESTART")
   # shellcheck disable=SC2206
   [[ -n "${EXTRA_DOCKER_ARGS:-}" ]] && DOCKER_ARGS+=($EXTRA_DOCKER_ARGS)
-  DOCKER_ARGS+=(--entrypoint vllm "$IMAGE")   # 이미지마다 엔트리포인트가 달라 vllm으로 고정
+  DOCKER_ARGS+=(--entrypoint vllm "$IMAGE")   # 이미지마다 엔트리포인트가 달라 vllm으로 고정 (빌드 이미지는 비어 있음)
   echo ">> 컨테이너 $NAME 시작 (GPU $GPUS, PROFILE=$PROFILE, 포트 $HOST_PORT)"
   run docker "${DOCKER_ARGS[@]}" "${VLLM_ARGS[@]}"
   wait_ready
@@ -149,7 +150,9 @@ case "$ACTION" in
     else
       run git clone --depth 1 https://github.com/vllm-project/vllm-omni.git "$OMNI_SRC"
     fi
-    run docker pull "$IMAGE"
+    [[ "$DRY_RUN" == "1" || -f "$OMNI_SRC/docker/Dockerfile.cuda" ]] || die "Dockerfile이 없습니다: $OMNI_SRC/docker/Dockerfile.cuda"
+    echo ">> 이미지 빌드: $IMAGE (vllm/vllm-openai 기반, LMCache 컴파일 포함이라 수십 분 걸릴 수 있음)"
+    run docker build -f "$OMNI_SRC/docker/Dockerfile.cuda" -t "$IMAGE" "$OMNI_SRC"
     ;;
   start)   docker_start ;;
   stop)    run docker rm -f "$NAME" ;;
