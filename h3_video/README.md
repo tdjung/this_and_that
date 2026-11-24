@@ -22,7 +22,7 @@ bash serve.sh check
 #    최초 1회: vLLM-Omni 최신 소스를 받고, vLLM 버전까지 맞춘 docker 이미지 빌드 (수십 분)
 #    사내 프록시·PyPI 미러가 있으면 함께 지정 (빌드 안의 apt, pip에 전달됨)
 HTTPS_PROXY=http://<프록시>:<포트> HTTP_PROXY=http://<프록시>:<포트> \
-PIP_INDEX_URL=http://<사내 PyPI 미러>/simple \
+PIP_INDEX_URL=http://<사내 PyPI 미러>/simple PIP_TRUSTED_HOST=<pip.conf의 trusted-host> \
 bash serve.sh setup
 #    설정만 바꿔 다시 빌드할 때 → bash serve.sh build
 #    패키지 설치 단계에서 실패하면 → 같은 변수로 bash serve.sh diag (빌드와 같은 조건에서 인덱스 접근을 1분 안에 시험)

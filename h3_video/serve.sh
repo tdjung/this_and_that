@@ -40,6 +40,8 @@
 #                           # 셸에 설정돼 있으면 빌드 안의 apt, pip(uv)에 그대로 전달합니다.
 #                           # docker 데몬의 프록시 설정은 이미지 pull에만 쓰이고 빌드 RUN 단계에는 전달되지 않습니다.
 #   PIP_INDEX_URL=          # 사내 PyPI 미러 주소 (예: http://nexus.local/repository/pypi/simple). 빌드 안의 pip, uv에 사용
+#   PIP_TRUSTED_HOST=       # pip.conf의 trusted-host 값 (예: nexus.local). 여러 개면 공백으로 구분.
+#                           # 빌드는 pip가 아니라 uv로 설치해서, uv의 UV_INSECURE_HOST로도 같이 넘깁니다.
 #   SKIP_NVIDIA_APT=1       # 빌드 중 NVIDIA apt 저장소(developer.download.nvidia.com)를 빼고 apt-get update
 #                           # (빌드에 필요한 git, jq는 Ubuntu 저장소에 있음)
 #   BUILD_NETWORK=host      # docker build --network. 프록시가 호스트의 127.0.0.1에 떠 있어도 닿도록 host
@@ -170,6 +172,9 @@ build_image() {
   if [[ -n "${PIP_INDEX_URL:-}" ]]; then
     inject+="ENV PIP_INDEX_URL=${PIP_INDEX_URL} UV_DEFAULT_INDEX=${PIP_INDEX_URL} UV_INDEX_URL=${PIP_INDEX_URL}"$'\n'
   fi
+  if [[ -n "${PIP_TRUSTED_HOST:-}" ]]; then
+    inject+="ENV PIP_TRUSTED_HOST=\"${PIP_TRUSTED_HOST}\" UV_INSECURE_HOST=\"${PIP_TRUSTED_HOST}\""$'\n'
+  fi
   if [[ "$DRY_RUN" != "1" ]]; then
     mkdir -p "$out_dir"
     # 첫 FROM 줄 바로 뒤에 inject 내용을 넣음
@@ -190,7 +195,7 @@ build_image() {
   BUILD_ARGS+=("$OMNI_SRC")
 
   echo ">> 이미지 빌드: $IMAGE (LMCache 컴파일 포함이라 수십 분 걸릴 수 있음)"
-  echo "   프록시: ${HTTPS_PROXY:-${https_proxy:-(없음)}} | PyPI 미러: ${PIP_INDEX_URL:-(없음)} | NVIDIA apt 제외: ${SKIP_NVIDIA_APT:-1}"
+  echo "   프록시: ${HTTPS_PROXY:-${https_proxy:-(없음)}} | PyPI 미러: ${PIP_INDEX_URL:-(없음)} | trusted-host: ${PIP_TRUSTED_HOST:-(없음)} | NVIDIA apt 제외: ${SKIP_NVIDIA_APT:-1}"
   run docker "${BUILD_ARGS[@]}"
 }
 
@@ -206,6 +211,9 @@ diag_index() {
   if [[ -n "${PIP_INDEX_URL:-}" ]]; then
     DARGS+=(-e "PIP_INDEX_URL=$PIP_INDEX_URL" -e "UV_DEFAULT_INDEX=$PIP_INDEX_URL" -e "UV_INDEX_URL=$PIP_INDEX_URL")
   fi
+  if [[ -n "${PIP_TRUSTED_HOST:-}" ]]; then
+    DARGS+=(-e "PIP_TRUSTED_HOST=$PIP_TRUSTED_HOST" -e "UV_INSECURE_HOST=$PIP_TRUSTED_HOST")
+  fi
   echo ">> $base 안에서 패키지 인덱스 확인 (프록시: ${HTTPS_PROXY:-${https_proxy:-(없음)}}, 미러: ${PIP_INDEX_URL:-(없음, pypi.org)})"
   run docker "${DARGS[@]}" "$base" -c '
     echo "--- 이미지/전달된 설정 (UV_*, PIP_*, *_proxy)"
@@ -215,10 +223,13 @@ diag_index() {
     IDX="${UV_DEFAULT_INDEX:-https://pypi.org/simple}"
     echo "--- 인덱스 응답: ${IDX%/}/setuptools/"
     python3 - "${IDX%/}/setuptools/" <<PY
-import sys, urllib.request
+import os, ssl, sys, urllib.request
 url = sys.argv[1]
+ctx = None
+if os.environ.get("UV_INSECURE_HOST"):   # trusted-host와 같은 효과: 인증서 검증 생략
+    ctx = ssl.create_default_context(); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
 try:
-    r = urllib.request.urlopen(urllib.request.Request(url, headers={"Accept": "text/html"}), timeout=30)
+    r = urllib.request.urlopen(urllib.request.Request(url, headers={"Accept": "text/html"}), timeout=30, context=ctx)
     body = r.read().decode("utf-8", "replace")
     n = body.count("setuptools-")
     print("  HTTP", r.status, "| setuptools 파일 링크", n, "개", "(정상)" if n else "(링크 없음: 인덱스 주소가 /simple 형식이 아니거나 미러에 패키지가 없음)")
