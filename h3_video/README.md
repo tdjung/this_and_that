@@ -25,6 +25,7 @@ HTTPS_PROXY=http://<프록시>:<포트> HTTP_PROXY=http://<프록시>:<포트> \
 PIP_INDEX_URL=http://<사내 PyPI 미러>/simple \
 bash serve.sh setup
 #    설정만 바꿔 다시 빌드할 때 → bash serve.sh build
+#    패키지 설치 단계에서 실패하면 → 같은 변수로 bash serve.sh diag (빌드와 같은 조건에서 인덱스 접근을 1분 안에 시험)
 
 # 3. 서버 실행 (GPU 0~3, 텐서 병렬 4, 호스트 포트 19300)
 MODEL_DIR=/data/models/MiniMax-H3 bash serve.sh

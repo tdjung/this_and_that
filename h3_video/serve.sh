@@ -4,6 +4,7 @@
 # 사용법:
 #   bash serve.sh check      # 빌드 전에: 기반 이미지(CUDA 13)가 이 서버 드라이버에서 GPU를 쓰는지 확인
 #   bash serve.sh setup      # 최초 1회: vLLM-Omni 최신 소스를 받고 docker 이미지 빌드 (vLLM 버전까지 맞춘 이미지)
+#   bash serve.sh diag       # 빌드가 패키지 설치에서 실패할 때: 빌드와 같은 조건(프록시, 미러)으로 setuptools 설치를 시험
 #   bash serve.sh build      # 소스는 그대로 두고 이미지만 다시 빌드 (프록시·미러 설정을 바꿨을 때)
 #   bash serve.sh start      # 컨테이너 시작 후 준비될 때까지 대기 (기본 동작)
 #   bash serve.sh stop       # 컨테이너 중지·삭제
@@ -175,6 +176,9 @@ build_image() {
     awk -v inject="$inject" '!done && /^FROM /{print; printf "%s", inject; done=1; next} {print}' "$src_df" > "$df"
   fi
 
+  if [[ -n "${PIP_INDEX_URL:-}" && "${PIP_INDEX_URL%/}" != */simple ]]; then
+    echo "!! PIP_INDEX_URL이 /simple로 끝나지 않습니다: $PIP_INDEX_URL  (pip/uv는 'simple' 형식 주소가 필요해요)" >&2
+  fi
   local BUILD_ARGS=(build -f "$df" -t "$IMAGE")
   [[ -n "${BUILD_NETWORK-host}" ]] && BUILD_ARGS+=(--network "${BUILD_NETWORK-host}")
   local v
@@ -190,7 +194,45 @@ build_image() {
   run docker "${BUILD_ARGS[@]}"
 }
 
+# 빌드 안과 같은 조건(기반 이미지, --network, 프록시, 미러)으로 패키지 인덱스 접근을 시험합니다.
+diag_index() {
+  local base="${CHECK_IMAGE:-vllm/vllm-openai:v0.34.0}"
+  local DARGS=(run --rm --entrypoint bash)
+  [[ -n "${BUILD_NETWORK-host}" ]] && DARGS+=(--network "${BUILD_NETWORK-host}")
+  local v
+  for v in HTTP_PROXY HTTPS_PROXY NO_PROXY http_proxy https_proxy no_proxy; do
+    [[ -n "${!v:-}" ]] && DARGS+=(-e "$v=${!v}")
+  done
+  if [[ -n "${PIP_INDEX_URL:-}" ]]; then
+    DARGS+=(-e "PIP_INDEX_URL=$PIP_INDEX_URL" -e "UV_DEFAULT_INDEX=$PIP_INDEX_URL" -e "UV_INDEX_URL=$PIP_INDEX_URL")
+  fi
+  echo ">> $base 안에서 패키지 인덱스 확인 (프록시: ${HTTPS_PROXY:-${https_proxy:-(없음)}}, 미러: ${PIP_INDEX_URL:-(없음, pypi.org)})"
+  run docker "${DARGS[@]}" "$base" -c '
+    echo "--- 이미지/전달된 설정 (UV_*, PIP_*, *_proxy)"
+    env | grep -iE "^(uv_|pip_|https?_proxy|no_proxy)" | sed "s/^/  /" || true
+    [ -f /etc/pip.conf ] && { echo "--- /etc/pip.conf"; sed "s/^/  /" /etc/pip.conf; }
+    [ -f /etc/uv/uv.toml ] && { echo "--- /etc/uv/uv.toml"; sed "s/^/  /" /etc/uv/uv.toml; }
+    IDX="${UV_DEFAULT_INDEX:-https://pypi.org/simple}"
+    echo "--- 인덱스 응답: ${IDX%/}/setuptools/"
+    python3 - "${IDX%/}/setuptools/" <<PY
+import sys, urllib.request
+url = sys.argv[1]
+try:
+    r = urllib.request.urlopen(urllib.request.Request(url, headers={"Accept": "text/html"}), timeout=30)
+    body = r.read().decode("utf-8", "replace")
+    n = body.count("setuptools-")
+    print("  HTTP", r.status, "| setuptools 파일 링크", n, "개", "(정상)" if n else "(링크 없음: 인덱스 주소가 /simple 형식이 아니거나 미러에 패키지가 없음)")
+    if not n: print("  응답 앞부분:", body[:300].replace(chr(10), " "))
+except Exception as e:
+    print("  접속 실패:", e)
+PY
+    echo "--- uv로 setuptools 설치 시험 (실제 설치는 안 함)"
+    uv pip install --dry-run --python "$(command -v python3)" "setuptools>=77.0.3,<81.0.0" wheel "setuptools-scm>=8" 2>&1 | tail -8 | sed "s/^/  /"
+  '
+}
+
 case "$ACTION" in
+  diag) diag_index ;;
   build)
     [[ -f "$OMNI_SRC/docker/Dockerfile.cuda" ]] || die "vLLM-Omni 소스가 없습니다: $OMNI_SRC ('bash $0 setup' 먼저 실행)"
     build_image
@@ -231,5 +273,5 @@ print(\"GPU:\", torch.cuda.get_device_name(0), \"| matmul OK:\", float((x @ x).s
       echo "health: (응답 없음)"
     fi
     ;;
-  *) die "알 수 없는 동작: $ACTION (check|setup|build|start|stop|restart|status|logs)" ;;
+  *) die "알 수 없는 동작: $ACTION (check|diag|setup|build|start|stop|restart|status|logs)" ;;
 esac
