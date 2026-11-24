@@ -158,6 +158,28 @@ docker_start() {
   wait_ready
 }
 
+# 사내 미러(PIP_INDEX_URL)와 trusted-host는 사내 주소라 프록시를 거치면 안 됩니다.
+# 거치면 사내 프록시의 차단 페이지(403)가 돌아옵니다. 그래서 NO_PROXY/no_proxy에 자동으로 추가합니다.
+add_internal_hosts_to_no_proxy() {
+  local hosts="" h
+  if [[ -n "${PIP_INDEX_URL:-}" ]]; then
+    h="${PIP_INDEX_URL#*://}"; h="${h%%/*}"; h="${h%%:*}"
+    hosts+=" $h"
+  fi
+  hosts+=" ${PIP_TRUSTED_HOST:-}"
+  NO_PROXY="${NO_PROXY:-${no_proxy:-}}"; no_proxy="${no_proxy:-$NO_PROXY}"   # 대소문자 중 하나만 있어도 맞춤
+  for h in $hosts; do
+    h="${h%%:*}"
+    [[ -z "$h" ]] && continue
+    [[ ",${NO_PROXY:-}," == *",$h,"* ]] || NO_PROXY="${NO_PROXY:+$NO_PROXY,}$h"
+    [[ ",${no_proxy:-}," == *",$h,"* ]] || no_proxy="${no_proxy:+$no_proxy,}$h"
+  done
+  # 프록시가 설정된 경우에만 의미가 있으므로 그때만 내보냄
+  if [[ -n "${HTTPS_PROXY:-}${https_proxy:-}${HTTP_PROXY:-}${http_proxy:-}" ]]; then
+    export NO_PROXY no_proxy
+  fi
+}
+
 # 사내망용으로 조정한 Dockerfile을 만들고 빌드합니다. 원본(docker/Dockerfile.cuda)은 건드리지 않습니다.
 #  - FROM 바로 뒤에: NVIDIA apt 저장소 제거(SKIP_NVIDIA_APT=1), 사내 PyPI 미러 지정(PIP_INDEX_URL)
 #  - 프록시는 docker 기본 build-arg(HTTP_PROXY 등)로 넘겨서 모든 RUN 단계에 적용
@@ -184,6 +206,7 @@ build_image() {
   if [[ -n "${PIP_INDEX_URL:-}" && "${PIP_INDEX_URL%/}" != */simple ]]; then
     echo "!! PIP_INDEX_URL이 /simple로 끝나지 않습니다: $PIP_INDEX_URL  (pip/uv는 'simple' 형식 주소가 필요해요)" >&2
   fi
+  add_internal_hosts_to_no_proxy
   local BUILD_ARGS=(build -f "$df" -t "$IMAGE")
   [[ -n "${BUILD_NETWORK-host}" ]] && BUILD_ARGS+=(--network "${BUILD_NETWORK-host}")
   local v
@@ -196,12 +219,14 @@ build_image() {
 
   echo ">> 이미지 빌드: $IMAGE (LMCache 컴파일 포함이라 수십 분 걸릴 수 있음)"
   echo "   프록시: ${HTTPS_PROXY:-${https_proxy:-(없음)}} | PyPI 미러: ${PIP_INDEX_URL:-(없음)} | trusted-host: ${PIP_TRUSTED_HOST:-(없음)} | NVIDIA apt 제외: ${SKIP_NVIDIA_APT:-1}"
+  [[ -n "${NO_PROXY:-}" ]] && echo "   NO_PROXY: $NO_PROXY"
   run docker "${BUILD_ARGS[@]}"
 }
 
 # 빌드 안과 같은 조건(기반 이미지, --network, 프록시, 미러)으로 패키지 인덱스 접근을 시험합니다.
 diag_index() {
   local base="${CHECK_IMAGE:-vllm/vllm-openai:v0.34.0}"
+  add_internal_hosts_to_no_proxy
   local DARGS=(run --rm --entrypoint bash)
   [[ -n "${BUILD_NETWORK-host}" ]] && DARGS+=(--network "${BUILD_NETWORK-host}")
   local v
@@ -236,6 +261,8 @@ try:
     if not n: print("  응답 앞부분:", body[:300].replace(chr(10), " "))
 except Exception as e:
     print("  접속 실패:", e)
+    if "403" in str(e):
+        print("  → 사내 프록시가 막은 응답입니다. 사내 미러라면 NO_PROXY에 들어갔는지(위 설정 목록), 외부 pypi.org라면 PIP_INDEX_URL로 사내 미러를 지정하세요.")
 PY
     echo "--- uv로 setuptools 설치 시험 (실제 설치는 안 함)"
     uv pip install --dry-run --python "$(command -v python3)" "setuptools>=77.0.3,<81.0.0" wheel "setuptools-scm>=8" 2>&1 | tail -8 | sed "s/^/  /"
