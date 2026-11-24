@@ -4,6 +4,7 @@
 # 사용법:
 #   bash serve.sh check      # 빌드 전에: 기반 이미지(CUDA 13)가 이 서버 드라이버에서 GPU를 쓰는지 확인
 #   bash serve.sh setup      # 최초 1회: vLLM-Omni 최신 소스를 받고 docker 이미지 빌드 (vLLM 버전까지 맞춘 이미지)
+#   bash serve.sh build      # 소스는 그대로 두고 이미지만 다시 빌드 (프록시·미러 설정을 바꿨을 때)
 #   bash serve.sh start      # 컨테이너 시작 후 준비될 때까지 대기 (기본 동작)
 #   bash serve.sh stop       # 컨테이너 중지·삭제
 #   bash serve.sh restart
@@ -33,6 +34,16 @@
 #   RESTART=                # docker 재시작 정책 (영상 만들 때만 띄우는 용도라 기본은 미지정)
 #   WAIT=1                  # start 후 /health 응답까지 대기 (최대 WAIT_TIMEOUT초)
 #   WAIT_TIMEOUT=1800       # 33B 모델 두 개(DiT, 텍스트 인코더)를 올려서 오래 걸릴 수 있음
+#   --- setup(이미지 빌드)용 ---
+#   HTTP_PROXY/HTTPS_PROXY/NO_PROXY (소문자도 가능)
+#                           # 셸에 설정돼 있으면 빌드 안의 apt, pip(uv)에 그대로 전달합니다.
+#                           # docker 데몬의 프록시 설정은 이미지 pull에만 쓰이고 빌드 RUN 단계에는 전달되지 않습니다.
+#   PIP_INDEX_URL=          # 사내 PyPI 미러 주소 (예: http://nexus.local/repository/pypi/simple). 빌드 안의 pip, uv에 사용
+#   SKIP_NVIDIA_APT=1       # 빌드 중 NVIDIA apt 저장소(developer.download.nvidia.com)를 빼고 apt-get update
+#                           # (빌드에 필요한 git, jq는 Ubuntu 저장소에 있음)
+#   BUILD_NETWORK=host      # docker build --network. 프록시가 호스트의 127.0.0.1에 떠 있어도 닿도록 host
+#   EXTRA_BUILD_ARGS=       # docker build에 덧붙일 인자
+#
 #   EXTRA_DOCKER_ARGS=      # docker run에 덧붙일 인자
 #   EXTRA_ARGS=             # vllm serve에 덧붙일 인자
 #
@@ -144,7 +155,46 @@ docker_start() {
   wait_ready
 }
 
+# 사내망용으로 조정한 Dockerfile을 만들고 빌드합니다. 원본(docker/Dockerfile.cuda)은 건드리지 않습니다.
+#  - FROM 바로 뒤에: NVIDIA apt 저장소 제거(SKIP_NVIDIA_APT=1), 사내 PyPI 미러 지정(PIP_INDEX_URL)
+#  - 프록시는 docker 기본 build-arg(HTTP_PROXY 등)로 넘겨서 모든 RUN 단계에 적용
+build_image() {
+  local src_df="$OMNI_SRC/docker/Dockerfile.cuda"
+  local out_dir; out_dir="$(cd "$(dirname "$0")" && pwd)/.build"
+  local df="$out_dir/Dockerfile.h3"
+  local inject=""
+  if [[ "${SKIP_NVIDIA_APT:-1}" == "1" ]]; then
+    inject+=$'RUN rm -f /etc/apt/sources.list.d/cuda*.list /etc/apt/sources.list.d/nvidia*.list\n'
+  fi
+  if [[ -n "${PIP_INDEX_URL:-}" ]]; then
+    inject+="ENV PIP_INDEX_URL=${PIP_INDEX_URL} UV_DEFAULT_INDEX=${PIP_INDEX_URL} UV_INDEX_URL=${PIP_INDEX_URL}"$'\n'
+  fi
+  if [[ "$DRY_RUN" != "1" ]]; then
+    mkdir -p "$out_dir"
+    # 첫 FROM 줄 바로 뒤에 inject 내용을 넣음
+    awk -v inject="$inject" '!done && /^FROM /{print; printf "%s", inject; done=1; next} {print}' "$src_df" > "$df"
+  fi
+
+  local BUILD_ARGS=(build -f "$df" -t "$IMAGE")
+  [[ -n "${BUILD_NETWORK-host}" ]] && BUILD_ARGS+=(--network "${BUILD_NETWORK-host}")
+  local v
+  for v in HTTP_PROXY HTTPS_PROXY NO_PROXY http_proxy https_proxy no_proxy; do
+    [[ -n "${!v:-}" ]] && BUILD_ARGS+=(--build-arg "$v=${!v}")
+  done
+  # shellcheck disable=SC2206
+  [[ -n "${EXTRA_BUILD_ARGS:-}" ]] && BUILD_ARGS+=($EXTRA_BUILD_ARGS)
+  BUILD_ARGS+=("$OMNI_SRC")
+
+  echo ">> 이미지 빌드: $IMAGE (LMCache 컴파일 포함이라 수십 분 걸릴 수 있음)"
+  echo "   프록시: ${HTTPS_PROXY:-${https_proxy:-(없음)}} | PyPI 미러: ${PIP_INDEX_URL:-(없음)} | NVIDIA apt 제외: ${SKIP_NVIDIA_APT:-1}"
+  run docker "${BUILD_ARGS[@]}"
+}
+
 case "$ACTION" in
+  build)
+    [[ -f "$OMNI_SRC/docker/Dockerfile.cuda" ]] || die "vLLM-Omni 소스가 없습니다: $OMNI_SRC ('bash $0 setup' 먼저 실행)"
+    build_image
+    ;;
   setup)
     if [[ -d "$OMNI_SRC/.git" ]]; then
       run git -C "$OMNI_SRC" pull --ff-only
@@ -152,8 +202,7 @@ case "$ACTION" in
       run git clone --depth 1 https://github.com/vllm-project/vllm-omni.git "$OMNI_SRC"
     fi
     [[ "$DRY_RUN" == "1" || -f "$OMNI_SRC/docker/Dockerfile.cuda" ]] || die "Dockerfile이 없습니다: $OMNI_SRC/docker/Dockerfile.cuda"
-    echo ">> 이미지 빌드: $IMAGE (vllm/vllm-openai 기반, LMCache 컴파일 포함이라 수십 분 걸릴 수 있음)"
-    run docker build -f "$OMNI_SRC/docker/Dockerfile.cuda" -t "$IMAGE" "$OMNI_SRC"
+    build_image
     ;;
   check)
     # 호스트 드라이버가 CUDA 12.x(R535 등)여도, 데이터센터 GPU(L40S 등)는 이미지 안의 forward compatibility
@@ -182,5 +231,5 @@ print(\"GPU:\", torch.cuda.get_device_name(0), \"| matmul OK:\", float((x @ x).s
       echo "health: (응답 없음)"
     fi
     ;;
-  *) die "알 수 없는 동작: $ACTION (check|setup|start|stop|restart|status|logs)" ;;
+  *) die "알 수 없는 동작: $ACTION (check|setup|build|start|stop|restart|status|logs)" ;;
 esac

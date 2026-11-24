@@ -20,7 +20,11 @@ hf download MiniMaxAI/MiniMax-H3 --local-dir /data/models/MiniMax-H3
 bash serve.sh check
 
 #    최초 1회: vLLM-Omni 최신 소스를 받고, vLLM 버전까지 맞춘 docker 이미지 빌드 (수십 분)
+#    사내 프록시·PyPI 미러가 있으면 함께 지정 (빌드 안의 apt, pip에 전달됨)
+HTTPS_PROXY=http://<프록시>:<포트> HTTP_PROXY=http://<프록시>:<포트> \
+PIP_INDEX_URL=http://<사내 PyPI 미러>/simple \
 bash serve.sh setup
+#    설정만 바꿔 다시 빌드할 때 → bash serve.sh build
 
 # 3. 서버 실행 (GPU 0~3, 텐서 병렬 4, 호스트 포트 19300)
 MODEL_DIR=/data/models/MiniMax-H3 bash serve.sh
@@ -57,3 +61,4 @@ mkdir -p frames && ffmpeg -ss 2 -i out/key_A_s42.mp4 -frames:v 1 frames/key_A.pn
 - 로컬 버전은 프롬프트 보정(H3-Context-IR)과 2K 변환이 없어서 출력은 768p(1344×768)입니다. 업스케일은 남는 GPU 4장에서 SeedVR2로 하고, 필름 그레인은 업스케일 뒤에 입힙니다.
 - 첫 프레임 필드 이름(`input_reference`)은 레시피에 명시돼 있지 않아 추정값입니다. 첫 결과에서 키프레임이 유지되는지 꼭 확인하세요.
 - 길이는 5초로 뽑고 편집에서 3초로 자릅니다 (최소 4초).
+- 빌드 안에서는 docker 데몬의 프록시 설정이 적용되지 않습니다. 셸의 `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`를 build-arg로 넘기고, NVIDIA apt 저장소(`developer.download.nvidia.com`)는 빌드에 필요 없어서 기본으로 빼고 `apt-get update`를 합니다 (`SKIP_NVIDIA_APT=0`이면 유지). 원본 Dockerfile은 그대로 두고 조정한 사본을 `.build/Dockerfile.h3`에 만들어 빌드합니다.
