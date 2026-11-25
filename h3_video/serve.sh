@@ -47,6 +47,7 @@
 #   BUILD_NETWORK=host      # docker build --network. 프록시가 호스트의 127.0.0.1에 떠 있어도 닿도록 host
 #   EXTRA_BUILD_ARGS=       # docker build에 덧붙일 인자
 #
+#   SKIP_VERIFY=0           # 1이면 start 전에 컨테이너 안에서 모델을 확인하는 단계를 건너뜀
 #   EXTRA_DOCKER_ARGS=      # docker run에 덧붙일 인자
 #   EXTRA_ARGS=             # vllm serve에 덧붙일 인자
 #
@@ -81,12 +82,69 @@ check_inputs() {
   if [[ "$DRY_RUN" != "1" ]] && ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
     die "이미지가 없습니다: $IMAGE  ('bash $0 setup'으로 빌드하거나 IMAGE=... 지정)"
   fi
+
+  # 컨테이너 안에서도 호스트와 같은 절대경로로 마운트합니다.
+  # HF 캐시(.../snapshots/<rev>)처럼 파일이 ../../blobs를 가리키는 심볼릭 링크면
+  # 그 폴더만 마운트하면 링크가 깨지므로, 링크가 가리키는 상위 폴더까지 함께 마운트합니다.
+  ABS_MODEL="$(cd "$MODEL_DIR" && pwd -P)"
+  MOUNT_ROOT="$ABS_MODEL"
+  local link target
+  while IFS= read -r -d '' link; do
+    target="$(readlink -f "$link")" || continue
+    while [[ "$target" != "$MOUNT_ROOT"/* && "$MOUNT_ROOT" != "/" ]]; do
+      MOUNT_ROOT="$(dirname "$MOUNT_ROOT")"
+    done
+  done < <(find "$ABS_MODEL" -type l -print0 2>/dev/null)
+  [[ "$MOUNT_ROOT" == "/" ]] && die "모델 파일 링크가 너무 넓은 범위를 가리킵니다. hf download --local-dir로 받은 실제 폴더를 쓰세요."
+  [[ "$MOUNT_ROOT" != "$ABS_MODEL" ]] && echo ">> 심볼릭 링크 대상까지 포함해 마운트: $MOUNT_ROOT"
+
+  local d missing=()
+  for d in text_encoder video_vae audio_vae; do
+    [[ -e "$ABS_MODEL/$d" || -e "$ABS_MODEL/FL2VA/$d" ]] || missing+=("$d")
+  done
+  if (( ${#missing[@]} )); then
+    echo "!! 공용 구성 요소 폴더를 찾지 못했습니다: ${missing[*]}" >&2
+    echo "   FL2VA만 받았다면 전체를 받으세요: hf download MiniMaxAI/MiniMax-H3 --local-dir $ABS_MODEL" >&2
+  fi
+  return 0
+}
+
+# 서버를 띄우기 전에 같은 이미지·마운트로 vLLM-Omni가 모델을 알아보는지 확인합니다 (몇 초).
+# "did not resolve to a registered Omni pipeline" 에러를 미리 잡기 위한 단계입니다.
+verify_model_in_container() {
+  [[ "$DRY_RUN" == "1" || "${SKIP_VERIFY:-0}" == "1" ]] && return 0
+  echo ">> 컨테이너 안에서 모델 경로 확인: $ABS_MODEL"
+  docker run --rm -v "${MOUNT_ROOT}:${MOUNT_ROOT}:ro" -e HF_HUB_OFFLINE=1 \
+    --entrypoint python3 "$IMAGE" - "$ABS_MODEL" <<'PY' || die "컨테이너 안에서 모델을 인식하지 못했습니다 (위 내용 참고)"
+import json, sys
+from pathlib import Path
+m = Path(sys.argv[1])
+ok = True
+idx = m / "model_index.json"
+if not idx.is_file():
+    print("  model_index.json: 컨테이너에서 보이지 않음 (마운트/링크 문제)"); sys.exit(1)
+cls = json.load(open(idx)).get("_class_name")
+print("  model_index.json _class_name:", cls)
+print("  FL2VA/model_index.json:", (m / "FL2VA" / "model_index.json").is_file())
+broken = [str(p.relative_to(m)) for p in m.rglob("*") if p.is_symlink() and not p.exists()][:5]
+if broken:
+    print("  깨진 링크:", broken); ok = False
+from vllm_omni.diffusion.data import resolve_model_class_name
+from vllm_omni.diffusion.registry import DiffusionModelRegistry
+resolved = resolve_model_class_name(str(m))
+supported = resolved in DiffusionModelRegistry.get_supported_archs()
+print("  vLLM-Omni가 읽은 파이프라인:", resolved, "| 지원:", supported)
+if not supported:
+    print("  → 이 이미지의 vLLM-Omni가 이 체크포인트 형식을 모릅니다. 'bash serve.sh setup'으로 최신 소스로 다시 빌드하세요.")
+    ok = False
+sys.exit(0 if ok else 1)
+PY
 }
 
 # vllm serve 인자 (컨테이너 안 경로 기준)
 vllm_args() {
   VLLM_ARGS=(
-    serve /models/MiniMax-H3
+    serve "$ABS_MODEL"
     --omni --trust-remote-code
     --task-type fl2va
     --host 0.0.0.0 --port 8000
@@ -133,8 +191,7 @@ docker_start() {
   if docker ps -a -q -f "name=^${NAME}$" | grep -q . && [[ "$DRY_RUN" != "1" ]]; then
     die "같은 이름의 컨테이너가 이미 있습니다: $NAME  ('bash $0 restart' 또는 NAME=... 지정)"
   fi
-  local abs_model
-  abs_model="$(cd "$MODEL_DIR" && pwd)"
+  verify_model_in_container
   vllm_args
   local DOCKER_ARGS=(
     run -d
@@ -142,7 +199,7 @@ docker_start() {
     -p "${HOST_PORT}:8000"
     --ipc=host
     --name "$NAME"
-    -v "${abs_model}:/models/MiniMax-H3:ro"
+    -v "${MOUNT_ROOT}:${MOUNT_ROOT}:ro"         # 호스트와 같은 경로로 마운트 (링크 유지)
     -e VLLM_WORKER_MULTIPROC_METHOD=spawn
     -e VLLM_OMNI_VIDEO_SYNC_TIMEOUT=14400     # 긴 생성이 타임아웃 나지 않게
     -e FLASHINFER_DISABLE_VERSION_CHECK=1
