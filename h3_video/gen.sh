@@ -34,8 +34,8 @@ fi
 DURATION="${H3_DURATION:-5.0}"   # 초 단위. 우리 컷은 5초로 뽑고 편집에서 자르기
 WIDTH="${H3_WIDTH:-1344}"        # 16:9, 짧은 변 768
 HEIGHT="${H3_HEIGHT:-768}"
-ASPECT="${H3_ASPECT:-16:9}"
-STEPS="${H3_STEPS:-50}"          # 생성 단계 수. 줄이면 빨라지지만 품질이 떨어질 수 있음 (키프레임 고르기용은 30 정도도 가능)      # 서버가 t2va에 aspect_ratio를 필수로 요구함
+ASPECT="${H3_ASPECT:-16:9}"      # 서버가 t2va에 aspect_ratio를 필수로 요구함
+STEPS="${H3_STEPS:-50}"          # 생성 단계 수. 줄이면 빨라지지만 품질이 떨어질 수 있음 (키프레임 고르기용은 30 정도도 가능)
 # 첫 프레임을 보내는 필드 이름. 레시피에 FL2VA용 이름이 명시돼 있지 않아서
 # 서버의 /openapi.json에서 확인한 이름으로 바꿔 쓰세요 (기본값: input_reference)
 IMAGE_FIELD="${H3_IMAGE_FIELD:-input_reference}"
