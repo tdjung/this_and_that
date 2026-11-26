@@ -70,13 +70,21 @@ for i in $(seq 0 $((N - 1))); do
     ARGS+=(-F "${IMAGE_FIELD}=@${FRAME}")
   fi
 
-  curl --fail-with-body -sS -X POST "$HOST/v1/videos/sync" "${ARGS[@]}" -o "$OUT"
+  # 오래된 curl(7.76 미만)에는 --fail-with-body가 없어서, 상태 코드를 직접 받아 판단해요
+  T0=$SECONDS
+  CODE=$(curl -sS -X POST "$HOST/v1/videos/sync" "${ARGS[@]}" -o "$OUT" -w '%{http_code}') || CODE="000"
+  if [[ "$CODE" != "200" ]]; then
+    echo "[$NAME] 요청 실패 (HTTP $CODE). 서버 응답:"; head -c 800 "$OUT" 2>/dev/null; echo
+    mv -f "$OUT" "${OUT%.mp4}.error.txt" 2>/dev/null || true
+    echo "$(date '+%F %T') | $NAME | seed=$SEED | FAILED HTTP $CODE" >> out/log.txt
+    continue
+  fi
 
   # 영상과 오디오 트랙이 제대로 들어갔는지 확인
   if ffmpeg -v error -i "$OUT" -map 0:v:0 -map 0:a:0 -f null - 2>/dev/null; then
-    echo "저장: $OUT"
+    echo "저장: $OUT ($((SECONDS - T0))초)"
   else
-    echo "확인 실패(오류 응답일 수 있어요): $OUT"; head -c 500 "$OUT"; echo
+    echo "확인 실패(영상/오디오 트랙 이상): $OUT"; head -c 300 "$OUT"; echo
   fi
 
   echo "$(date '+%F %T') | $NAME | task=$TASK | seed=$SEED | frame=${FRAME:-none} | prompt=$PROMPT_FILE" >> out/log.txt
