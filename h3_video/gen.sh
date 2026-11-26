@@ -7,6 +7,7 @@
 # 예:
 #   ./gen.sh prompts/key_A.txt key_A                         # 첫 프레임 없음 = 텍스트로만 생성(T2VA), 3개
 #   ./gen.sh prompts/cut_A.txt cut_A frames/key_A.png 3 42   # 첫 프레임 기반(FL2VA), 시드 42/43/44
+#   ./gen.sh prompts/key_A.txt test 1                        # 첫 프레임 없이 개수만 지정해도 됨 (세 번째가 숫자면 개수)
 #
 # 첫 프레임 이미지는 이 PC에서 업로드돼요. 서버 쪽 경로를 맞출 필요 없어요.
 set -euo pipefail
@@ -25,6 +26,11 @@ NAME="$2"
 FRAME="${3:-}"
 N="${4:-3}"
 SEED0="${5:-42}"
+# 세 번째 인자가 숫자이고 그런 파일이 없으면 "첫 프레임 없음 + 개수"로 해석 (예: ./gen.sh p.txt test 1)
+if [[ "$FRAME" =~ ^[0-9]+$ && ! -f "$FRAME" ]]; then
+  SEED0="${4:-42}"; N="$FRAME"; FRAME=""
+fi
+[[ "$FRAME" == "-" ]] && FRAME=""   # '-'도 첫 프레임 없음
 DURATION="${H3_DURATION:-5.0}"   # 초 단위. 우리 컷은 5초로 뽑고 편집에서 자르기
 WIDTH="${H3_WIDTH:-1344}"        # 16:9, 짧은 변 768
 HEIGHT="${H3_HEIGHT:-768}"
