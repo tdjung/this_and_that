@@ -11,6 +11,7 @@
 #   bash serve.sh restart
 #   bash serve.sh status     # 컨테이너 상태 + /health
 #   bash serve.sh logs       # docker logs -f
+#   bash serve.sh why        # 시작에 실패했을 때 로그에서 핵심 에러만 추려 보기
 #   DRY_RUN=1 bash serve.sh  # 실행할 docker 명령만 출력
 #
 # 예시:
@@ -150,11 +151,15 @@ vllm_args() {
     --host 0.0.0.0 --port 8000
   )
   case "$PROFILE" in
+    # 텍스트 인코더(Qwen3-VL 33B, BF16 약 67GB)는 DiT와 별도로 --text-encoder-tp-size로 나눠야 합니다.
+    # 기본값이 1이라 지정하지 않으면 GPU 한 장(48GB)에 통째로 올리다 메모리 부족으로 실패합니다.
     l40s)
       VLLM_ARGS+=(--num-gpus "$NGPU" --tensor-parallel-size "$NGPU" --usp 1
+                  --text-encoder-tp-size "$NGPU"
                   --vae-use-tiling --diffusion-attention-backend FLASH_ATTN) ;;
     l40s-offload)
       VLLM_ARGS+=(--num-gpus "$NGPU" --tensor-parallel-size "$NGPU" --usp 1
+                  --text-encoder-tp-size "$NGPU"
                   --vae-use-tiling --diffusion-attention-backend FLASH_ATTN
                   --enable-distributed-layerwise-offload --dlo-no-use-allgather --enforce-eager) ;;
     single)
@@ -167,6 +172,19 @@ vllm_args() {
   return 0
 }
 
+# 'Orchestrator initialization failed'나 shared_memory 경고는 결과일 뿐이고, 진짜 원인은 그 위 워커 로그에 있습니다.
+show_failure() {
+  local log; log="$(docker logs "$NAME" 2>&1 || true)"
+  echo "----- 핵심 에러 (Error/Exception/OOM 줄) -----"
+  grep -E "OutOfMemory|out of memory|CUDA error|Error:|Exception:|error:|unrecognized arguments|No module named|not supported|Traceback" <<<"$log" \
+    | grep -v "resource_tracker" | awk '!seen[$0]++' | tail -25
+  echo "----- 마지막 20줄 -----"
+  tail -20 <<<"$log"
+  if grep -qiE "OutOfMemory|out of memory" <<<"$log"; then
+    echo ">> 메모리 부족입니다. PROFILE=l40s-offload로, 그래도 안 되면 GPUS=0,1,2,3,4,5,6,7로 8장 모두 써서 restart 하세요."
+  fi
+}
+
 wait_ready() {
   [[ "$WAIT" == "1" && "$DRY_RUN" != "1" ]] || return 0
   local url="http://127.0.0.1:${HOST_PORT}/health" t0=$SECONDS
@@ -177,8 +195,8 @@ wait_ready() {
       return 0
     fi
     if ! docker ps -q -f "name=^${NAME}$" | grep -q .; then
-      docker logs --tail 40 "$NAME" 2>&1 || true
-      die "컨테이너가 종료되었습니다. 메모리 부족이면 PROFILE=l40s-offload로 다시 시도하세요."
+      show_failure
+      die "컨테이너가 종료되었습니다. 위의 '핵심 에러'를 확인하세요."
     fi
     sleep 15
   done
@@ -360,6 +378,7 @@ print(\"GPU:\", torch.cuda.get_device_name(0), \"| matmul OK:\", float((x @ x).s
   stop)    run docker rm -f "$NAME" ;;
   restart) run docker rm -f "$NAME" >/dev/null 2>&1 || true; docker_start ;;
   logs)    exec docker logs -f "$NAME" ;;
+  why)     show_failure ;;   # 컨테이너가 죽은 뒤 원인만 추려 보기
   status)
     docker ps -a -f "name=^${NAME}$" --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'
     if curl -sf "http://127.0.0.1:${HOST_PORT}/health" >/dev/null 2>&1; then
@@ -368,5 +387,5 @@ print(\"GPU:\", torch.cuda.get_device_name(0), \"| matmul OK:\", float((x @ x).s
       echo "health: (응답 없음)"
     fi
     ;;
-  *) die "알 수 없는 동작: $ACTION (check|diag|setup|build|start|stop|restart|status|logs)" ;;
+  *) die "알 수 없는 동작: $ACTION (check|diag|setup|build|start|stop|restart|status|logs|why)" ;;
 esac
