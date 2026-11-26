@@ -54,6 +54,19 @@ mkdir -p frames && ffmpeg -ss 2 -i out/key_A_s42.mp4 -frames:v 1 frames/key_A.pn
 포트를 바꿨다면 `gen.sh`도 `H3_HOST=http://127.0.0.1:<포트>`로 맞춥니다.
 결과는 `out/`에, 설정 기록은 `out/log.txt`에 저장됩니다.
 
+## 다른 서버에서 생성하기
+
+GPU 서버에서 `serve.sh`로 띄운 뒤, 다른 서버에서는 이 폴더만 있으면 됩니다 (`curl`, `jq`, `ffmpeg` 필요).
+첫 프레임 이미지는 요청에 첨부돼 올라가므로 GPU 서버와 경로를 맞출 필요가 없습니다.
+
+```bash
+export H3_HOST=http://<GPU서버IP>:19300
+curl -s $H3_HOST/health                      # 접속 확인 (안 되면 방화벽에서 19300 허용)
+./gen.sh prompts/key_A.txt key_A
+```
+
+`gen.sh`는 GPU 서버 주소를 자동으로 `NO_PROXY`에 넣어 사내 프록시를 거치지 않게 합니다.
+
 ## 주의
 
 - 이미지는 vLLM-Omni 저장소의 `docker/Dockerfile.cuda`로 직접 빌드합니다 (`vllm-omni-h3:local`). vLLM-Omni 소스와 vLLM 버전이 짝이 맞아야 해서, 오래된 `vllm/vllm-omni:minimax-h3` 이미지에 최신 소스만 마운트하면 `compute_mm_prefix_ranges` 같은 vLLM API 불일치 에러가 납니다. 빌드 대신 Docker Hub의 `vllm/vllm-omni:nightly-<커밋>` 이미지를 `IMAGE=`로 지정해도 됩니다.

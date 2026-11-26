@@ -11,7 +11,15 @@
 # 첫 프레임 이미지는 이 PC에서 업로드돼요. 서버 쪽 경로를 맞출 필요 없어요.
 set -euo pipefail
 
-HOST="${H3_HOST:-http://127.0.0.1:19300}"   # serve.sh의 HOST_PORT와 맞추기
+HOST="${H3_HOST:-http://127.0.0.1:19300}"   # serve.sh의 HOST_PORT와 맞추기. 다른 서버에서: H3_HOST=http://<GPU서버IP>:19300
+
+# GPU 서버는 사내 주소라 프록시를 거치면 안 됩니다 (거치면 사내 프록시 차단 페이지 403).
+_h="${HOST#*://}"; _h="${_h%%/*}"; _h="${_h%%:*}"
+export NO_PROXY="${NO_PROXY:+$NO_PROXY,}$_h" no_proxy="${no_proxy:+$no_proxy,}$_h"
+
+for _c in curl jq ffmpeg; do
+  command -v "$_c" >/dev/null || { echo "$_c 명령이 필요해요 (예: sudo apt-get install -y $_c)"; exit 1; }
+done
 PROMPT_FILE="$1"
 NAME="$2"
 FRAME="${3:-}"
