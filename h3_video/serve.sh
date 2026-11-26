@@ -190,7 +190,7 @@ wait_ready() {
   local url="http://127.0.0.1:${HOST_PORT}/health" t0=$SECONDS
   echo ">> 준비 대기 중 ($url, 모델 로딩에 10분 이상 걸릴 수 있음). 진행 상황: bash $0 logs"
   while (( SECONDS - t0 < WAIT_TIMEOUT )); do
-    if curl -sf "$url" >/dev/null 2>&1; then
+    if curl --noproxy "*" -sf "$url" >/dev/null 2>&1; then
       echo ">> 준비 완료 ($((SECONDS - t0))초). 테스트: H3_DURATION=4.0 ./gen.sh prompts/key_A.txt test 1"
       return 0
     fi
@@ -381,7 +381,7 @@ print(\"GPU:\", torch.cuda.get_device_name(0), \"| matmul OK:\", float((x @ x).s
   why)     show_failure ;;   # 컨테이너가 죽은 뒤 원인만 추려 보기
   status)
     docker ps -a -f "name=^${NAME}$" --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'
-    if curl -sf "http://127.0.0.1:${HOST_PORT}/health" >/dev/null 2>&1; then
+    if curl --noproxy "*" -sf "http://127.0.0.1:${HOST_PORT}/health" >/dev/null 2>&1; then
       echo "health: OK (http://127.0.0.1:${HOST_PORT})"
     else
       echo "health: (응답 없음)"
