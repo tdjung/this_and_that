@@ -71,6 +71,7 @@ class Router:
                 raise ValueError(f"tier {t.name}: unknown backend {t.backend}")
             for o in t.overflow:
                 self.cfg.index(o)
+            self.backends[t.backend].expected_models.add(t.model)   # health probe checks the served model
         self.rc_policy = raw.get("request_classes", {})
         self.agent_types = raw.get("agent_types", {})
         s = raw.get("session", {})
@@ -85,6 +86,7 @@ class Router:
         self.quota_retry_after = float(fb.get("quota_min_retry_after_s", 60))
         self.quota_cooldown = float(fb.get("quota_cooldown_minutes", 30)) * 60
         self.metrics_interval = float(raw.get("metrics_interval_s", 5))
+        self.idle_health_interval = float(raw.get("idle_health_interval_s", 60))
         self.budget = Budget(raw.get("budget"))
         b = raw.get("budget") or {}
         self.meter = UsageMeter(b.get("usage_path", "~/.claude_auto/usage.json"),
@@ -98,9 +100,11 @@ class Router:
         self.log_path = Path(os.path.expanduser(raw.get("log_path", "~/.claude_auto/decisions.jsonl")))
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         timeout = httpx.Timeout(600, connect=10)
+        # a dead internal host that drops packets should cost seconds, not the 10 s external default
+        direct_timeout = httpx.Timeout(600, connect=float(raw.get("internal_connect_timeout_s", 3)))
         # external backends (Anthropic) honour http(s)_proxy env vars; internal servers and JEV go direct
         self.client = httpx.AsyncClient(transport=transport, timeout=timeout, trust_env=True)
-        self.direct = httpx.AsyncClient(transport=transport, timeout=timeout, trust_env=False)
+        self.direct = httpx.AsyncClient(transport=transport, timeout=direct_timeout, trust_env=False)
         if jev is not None:
             self.jev = jev
         else:
@@ -322,9 +326,19 @@ class Router:
             srv.inflight += 1
             try:
                 resp = await http.send(req, stream=True)
-            except httpx.TransportError as e:
+            except (httpx.ReadTimeout, httpx.WriteTimeout, httpx.PoolTimeout) as e:
+                # connected, but no answer in time: alive and slow, not dead
                 srv.inflight -= 1
-                be.mark_down(srv)
+                be.mark_busy(srv, 60)
+                info["reason"] += f" | {srv.url} slow({type(e).__name__})"
+                last_err = (504, {"content-type": "application/json"}, json.dumps(
+                    {"type": "error", "error": {"type": "api_error",
+                                                "message": f"claude_auto: {be.name} timed out: {e}"}}).encode())
+                continue
+            except httpx.TransportError as e:
+                # refused / connect timeout / connection dropped: dead until a health probe succeeds
+                srv.inflight -= 1
+                be.mark_down(srv, reason=f"request: {type(e).__name__}")
                 info["reason"] += f" | {srv.url} {type(e).__name__}"
                 last_err = (502, {"content-type": "application/json"}, json.dumps(
                     {"type": "error", "error": {"type": "api_error",
@@ -345,6 +359,15 @@ class Router:
                     idx, escalated = lower, True       # no escalating back into the blocked backend
                     continue
                 break
+            if not be.external and resp.status_code == 404:
+                # /v1/messages not found: another service (or model) is on this port now
+                await resp.aread()
+                await resp.aclose()
+                srv.inflight -= 1
+                be.mark_down(srv, reason="404 on /v1/messages (wrong service on this port?)")
+                info["reason"] += f" | {srv.url} 404"
+                last_err = (resp.status_code, dict(resp.headers), resp.content)
+                continue
             if not be.external and (resp.status_code >= 500 or resp.status_code == 429):
                 await resp.aread()
                 await resp.aclose()
@@ -409,23 +432,62 @@ class Router:
                  rec.get("reason"))
 
     # ------------------------------------------------------------ background
-    async def poll_metrics(self):
+    async def poll_servers(self):
+        """Health every metrics_interval while active, every idle_health_interval while idle;
+        load metrics only while active (don't poll other people's servers for nothing)."""
+        last = 0.0
         while True:
             await asyncio.sleep(self.metrics_interval)
-            if time.time() - self.last_request > 120:      # idle: don't poll other people's servers
+            idle = time.time() - self.last_request > 120
+            if idle and time.time() - last < self.idle_health_interval:
                 continue
-            jobs = [(be, s) for be in self.backends.values() if be.metrics for s in be.servers]
+            last = time.time()
+            await self.probe_once(metrics=not idle)
 
-            async def one(be, s):
-                try:
-                    r = await self.http_for(be).get(s.url + "/metrics", timeout=2,
-                                              headers=self.upstream_headers({}, be))
-                    if r.status_code == 200:
-                        s.running, s.waiting = parse_metrics(r.text)
-                        s.metrics_ts = time.time()
-                except httpx.HTTPError:
-                    pass
-            await asyncio.gather(*(one(be, s) for be, s in jobs))
+    async def probe_once(self, metrics: bool = True):
+        jobs = [(be, s) for be in self.backends.values() for s in be.servers
+                if s.drained_until <= time.time() and (be.health or (metrics and be.metrics))]
+        await asyncio.gather(*(self.probe_server(be, s, metrics) for be, s in jobs))
+
+    async def probe_server(self, be: Backend, s: Server, metrics: bool = True):
+        http = self.http_for(be)
+        hdr = self.upstream_headers({}, be)
+        if be.health:
+            t0 = time.time()
+            try:
+                r = await http.get(s.url + be.health_path, headers=hdr, timeout=httpx.Timeout(5, connect=2))
+                ms = round((time.time() - t0) * 1000)
+                expected = {s.model} if s.model else be.expected_models
+                if r.status_code == 404:
+                    be.record_health(s, "ok", f"{be.health_path} 404 (liveness only)", ms)
+                elif r.status_code in (401, 403):
+                    be.record_health(s, "ok", f"{be.health_path} {r.status_code} (auth; liveness only)", ms)
+                elif r.status_code >= 500 or r.status_code == 429:
+                    be.record_health(s, "slow", f"{be.health_path} {r.status_code}", ms)
+                elif r.status_code != 200:
+                    be.record_health(s, "dead", f"{be.health_path} {r.status_code}", ms)
+                else:
+                    served = []
+                    try:
+                        served = [m.get("id") for m in (r.json().get("data") or []) if isinstance(m, dict)]
+                    except ValueError:
+                        pass
+                    if served and expected and not (set(served) & expected):
+                        be.record_health(s, "dead", f"wrong model: serves {served[:3]}, expected {sorted(expected)}", ms)
+                    else:
+                        be.record_health(s, "ok", "", ms)
+            except (httpx.ReadTimeout, httpx.WriteTimeout, httpx.PoolTimeout) as e:
+                be.record_health(s, "slow", f"probe {type(e).__name__}", round((time.time() - t0) * 1000))
+            except httpx.HTTPError as e:
+                be.record_health(s, "dead", f"probe {type(e).__name__}")
+        if metrics and be.metrics and be.available(s):
+            try:
+                r = await http.get(s.url + "/metrics", timeout=2, headers=hdr)
+                if r.status_code == 200:
+                    s.running, s.waiting = parse_metrics(r.text)
+                    s.metrics_ts = time.time()
+            except httpx.HTTPError:
+                pass
 
 
 def create_app(raw: dict, transport=None, jev=None, background: bool = True) -> FastAPI:
@@ -435,7 +497,7 @@ def create_app(raw: dict, transport=None, jev=None, background: bool = True) -> 
     async def lifespan(_app):
         tasks = []
         if background:
-            tasks = [asyncio.create_task(router.poll_metrics()),
+            tasks = [asyncio.create_task(router.poll_servers()),
                      asyncio.create_task(router.budget.run(router.client))]
         yield
         for t in tasks:
@@ -494,6 +556,27 @@ def create_app(raw: dict, transport=None, jev=None, background: bool = True) -> 
     @app.get("/backends")
     async def backends():
         return {k: be.status() for k, be in router.backends.items()}
+
+    @app.post("/backends/drain")
+    async def backends_drain(request: Request):
+        """Take servers out by hand: {"url": "gpu01:8000", "minutes": 120}; minutes 0 puts them back.
+        Matches every server whose URL contains `url`. Affects only this proxy."""
+        try:
+            body = await request.json()
+            needle, minutes = str(body["url"]), float(body.get("minutes", 60))
+        except (ValueError, KeyError, TypeError):
+            return JSONResponse({"error": 'body: {"url": "<host:port>", "minutes": 120}'}, status_code=400)
+        hit = []
+        for be in router.backends.values():
+            for s in be.servers:
+                if needle in s.url:
+                    be.drain(s, minutes)
+                    if minutes <= 0:
+                        await router.probe_server(be, s, metrics=False)
+                    hit.append(s.url)
+        if not hit:
+            return JSONResponse({"error": f"no server matches {needle!r}"}, status_code=404)
+        return {"drained" if minutes > 0 else "restored": hit, "minutes": minutes}
 
     @app.get("/sessions")
     async def sessions():

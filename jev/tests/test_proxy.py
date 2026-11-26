@@ -57,6 +57,16 @@ class Upstream:
 
     def __call__(self, request: httpx.Request):
         host = request.url.host
+        if host in getattr(self, "dead", ()):                     # port closed / host down
+            raise httpx.ConnectError("connection refused", request=request)
+        if host in getattr(self, "stuck", ()):                    # accepts, never answers
+            raise httpx.ReadTimeout("timed out", request=request)
+        if request.url.path == "/v1/models":
+            ids = getattr(self, "models", {}).get(host)
+            if ids is None:
+                return resp(404, {}, b"")
+            return resp(200, {"content-type": "application/json"},
+                        json.dumps({"object": "list", "data": [{"id": i} for i in ids]}).encode())
         self.requests.append(request)
         if request.url.path.endswith("count_tokens"):
             return resp(404, {"content-type": "application/json"}, b'{"error":"nope"}')
@@ -458,3 +468,114 @@ def test_local_spend_drives_budget_level(env):
     assert post(c, msgs_user("feature")).headers["x-claude-auto-tier"] == "qwen3.8-fn"
     c.post("/usage", json={"set_spent_usd": 0})
     assert c.get("/budget").json()["level"] == "normal"
+
+
+# ------------------------------------------------------------------ dead vs slow vs wrong service
+def _router(c):
+    return c.app.state.router
+
+
+def _probe(c):
+    import asyncio
+    asyncio.run(_router(c).probe_once(metrics=False))
+
+
+def _state(c, backend, host):
+    return next(s["state"] for s in _router(c).backends[backend].status() if host in s["url"])
+
+
+def test_refused_server_stays_out_until_probe_succeeds(env):
+    c, up, jev, _ = env
+    jev.next = "qwen3.8-27b"
+    post(c, msgs_user("q"), sid="a")
+    first = up.last()[0]
+    up.dead = {first}
+    r = post(c, msgs_user("q2"), sid="a")                         # refused -> another 27b server
+    assert r.status_code == 200 and up.last()[0] != first and up.last()[0].startswith("qwen27b-")
+    assert _state(c, "internal-27b", first) == "down"
+    _probe(c)                                                     # still dead: stays down
+    assert _state(c, "internal-27b", first) == "down"
+    up.dead = set()
+    up.models = {first: ["qwen3.8-27b"]}
+    _probe(c)                                                     # back: one good probe restores it
+    assert _state(c, "internal-27b", first) == "ok"
+
+
+def test_wrong_model_on_port_is_taken_out(env):
+    c, up, jev, _ = env
+    jev.next = "qwen3.8-27b"
+    hosts = [f"qwen27b-{i}.internal" for i in (1, 2, 3)]
+    up.models = {h: ["qwen3.8-27b"] for h in hosts}
+    up.models[hosts[0]] = ["MiniMaxAI/MiniMax-H3"]                # port reused by another server
+    _probe(c)
+    assert _state(c, "internal-27b", hosts[0]) == "ok"            # one bad probe is not enough
+    _probe(c)
+    assert _state(c, "internal-27b", hosts[0]) == "down"
+    reason = next(s["health"]["reason"] for s in c.get("/backends").json()["internal-27b"]
+                  if hosts[0] in s["url"])
+    assert "wrong model" in reason
+    for i in range(10):
+        post(c, msgs_user("q"), sid=f"w{i}")
+        assert up.last()[0] != hosts[0]
+
+
+def test_stuck_server_is_busy_first_then_down(env):
+    c, up, jev, _ = env
+    host = "qwen27b-1.internal"
+    up.models = {f"qwen27b-{i}.internal": ["qwen3.8-27b"] for i in (1, 2, 3)}
+    up.stuck = {host}
+    _probe(c)
+    assert _state(c, "internal-27b", host) == "busy"              # slow is not dead
+    for _ in range(3):
+        _probe(c)
+    assert _state(c, "internal-27b", host) == "down"              # stuck for 4 probes in a row
+
+
+def test_request_timeout_marks_busy_not_down(env):
+    c, up, jev, _ = env
+    jev.next = "qwen3.8-27b"
+    post(c, msgs_user("q"), sid="t")
+    first = up.last()[0]
+    up.stuck = {first}
+    r = post(c, msgs_user("q2"), sid="t")
+    assert r.status_code == 200 and up.last()[0] != first
+    assert _state(c, "internal-27b", first) == "busy"
+
+
+def test_404_on_messages_means_wrong_service(env):
+    c, up, jev, _ = env
+    jev.next = "qwen3.8-27b"
+    post(c, msgs_user("q"), sid="n")
+    first = up.last()[0]
+    up.script[first] = [(404, {})]
+    r = post(c, msgs_user("q2"), sid="n")
+    assert r.status_code == 200 and up.last()[0] != first
+    assert _state(c, "internal-27b", first) == "down"
+
+
+def test_manual_drain_and_restore(env):
+    c, up, jev, _ = env
+    jev.next = "qwen3.8-27b"
+    up.models = {f"qwen27b-{i}.internal": ["qwen3.8-27b"] for i in (1, 2, 3)}
+    r = c.post("/backends/drain", json={"url": "qwen27b-1.internal", "minutes": 120})
+    assert r.status_code == 200 and r.json()["drained"] == ["http://qwen27b-1.internal:8000"]
+    for i in range(10):
+        post(c, msgs_user("q"), sid=f"d{i}")
+        assert up.last()[0] != "qwen27b-1.internal"
+    assert c.post("/backends/drain", json={"url": "nope", "minutes": 5}).status_code == 404
+    r = c.post("/backends/drain", json={"url": "qwen27b-1.internal", "minutes": 0})
+    assert r.json()["restored"] and _state(c, "internal-27b", "qwen27b-1.internal") == "ok"
+
+
+def test_disabled_server_in_config(tmp_path, monkeypatch):
+    raw = yaml.safe_load((ROOT / "proxy" / "config.example.yaml").read_text())
+    raw["log_path"] = str(tmp_path / "log.jsonl")
+    raw["budget"]["usage_path"] = str(tmp_path / "usage.json")
+    raw["backends"]["internal-27b"]["servers"][0]["enabled"] = False
+    up = Upstream()
+    jev = FakeJev(raw["tiers"])
+    with TestClient(create_app(raw, transport=httpx.MockTransport(up), jev=jev, background=False)) as c:
+        for i in range(10):
+            post(c, msgs_user("q"), sid=f"e{i}")
+            assert up.last()[0] != "qwen27b-1.internal"
+        assert _state(c, "internal-27b", "qwen27b-1.internal") == "drained"

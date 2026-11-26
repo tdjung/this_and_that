@@ -49,7 +49,7 @@ claude_auto (런처)
 | `proxy/server.py`, `pool.py`, `budget.py`, `usage.py` | 라우팅 프록시, 서버 풀, 예산, 사용액 계산 |
 | `proxy/config.example.yaml` | 티어, 룰, 예산 정책 등 모든 설정 |
 | `bin/claude_auto` | 프록시를 띄우고 Claude Code를 그 프록시로 실행 |
-| `tests/test_proxy.py` | 목업 백엔드 테스트 35개 (모두 통과) |
+| `tests/test_proxy.py` | 목업 백엔드 테스트 42개 (모두 통과) |
 
 ### 라우팅 로직 요약
 1. `/model claude-tier-<이름>`으로 직접 고르면 그 티어로 고정

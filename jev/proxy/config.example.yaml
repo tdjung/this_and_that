@@ -49,7 +49,24 @@ jev:
 # max_waiting: 대기열이 이 값을 넘는 서버는 '바쁨'으로 보고 다른 서버/overflow 티어로 보냅니다.
 # use_env_proxy: 셸의 http_proxy/https_proxy(사내 프록시)를 쓸지. 기본값은 external 백엔드만 true.
 #                내부 서버와 JEV 요청은 사내 프록시를 거치지 않고 직접 접속합니다.
+#
+# 서버 상태 확인 (내부 백엔드는 기본으로 켜짐): 죽은 서버와 느린 서버를 구분합니다.
+#   죽음(down, 안 보냄): 접속 거부·접속 타임아웃, 상태 확인 연속 실패, 다른 모델이 떠 있음
+#                       (같은 포트를 다른 서버가 쓰는 경우), /v1/messages에 404.
+#                       상태 확인이 한 번 성공해야 다시 씁니다 (정해진 시간이 지나도 자동 복귀하지 않음).
+#   느림(busy, 최후 수단으로만): 대기열 > max_waiting, 429/5xx, 요청 중 응답 타임아웃,
+#                       상태 확인 응답 > slow_ms. 응답 타임아웃이 down_after_timeouts번 이어지면 죽음.
+#   health_check: true          # 백엔드별로 끌 수 있음 (external 백엔드는 기본 false)
+#   health_path: /v1/models     # 200이면 서빙 중인 모델 목록을 티어의 model(또는 서버의 model)과 비교.
+#                               # 404·401·403이면 살아 있다는 것만 확인
+#   down_after_fails: 2         # 연속 실패 몇 번이면 죽음으로 볼지
+#   down_after_timeouts: 4      # 접속은 되는데 응답이 없는 상태가 몇 번이면 죽음으로 볼지
+#   slow_ms: 3000               # 상태 확인 응답이 이보다 느리면 바쁨
+# 서버를 잠시 빼려면: 설정에서 {url: ..., enabled: false}, 또는 실행 중에
+#   curl -XPOST localhost:8787/backends/drain -d '{"url":"gpu01:8000","minutes":120}'   (minutes 0이면 복귀)
 metrics_interval_s: 5
+idle_health_interval_s: 60       # 요청이 없을 때도 이 간격으로 상태 확인 (부하 지표는 안 읽음)
+internal_connect_timeout_s: 3    # 내부 서버 접속 타임아웃. 죽은 서버에서 오래 기다리지 않게
 
 backends:
   internal-27b:

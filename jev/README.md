@@ -120,6 +120,24 @@ claude_auto                            # 평소 claude 대신 실행
 - 대기열이 `max_waiting`을 넘으면 '바쁨'입니다. flash-next는 1대라 `max_waiting: 2`로 낮게 두고, 바쁘면 27b 풀로 넘기도록 `overflow: [qwen3.8-27b]`를 걸었습니다. Anthropic으로는 새지 않습니다.
 - `/health`의 `stats.decided`(분류 결과)와 `stats.served`(실제 처리)를 비교하면 overflow가 얼마나 일어나는지 보입니다. flash-next 비중이 서버 대수 비율(약 20%)보다 계속 높다면 `tiers[].criteria`를 조정해 일부 작업을 27b 티어로 옮기세요.
 
+### 죽은 서버와 느린 서버 구분
+
+내부 서버는 요청과 별도로 상태를 확인합니다 (`/v1/models`, 사용 중 5초, 쉬는 중 60초 간격).
+
+| 상태 | 판단 기준 | 동작 |
+|---|---|---|
+| `down` (죽음) | 접속 거부·접속 타임아웃, 상태 확인 2회 연속 실패, **다른 모델이 떠 있음**, `/v1/messages`에 404 | 보내지 않음. 상태 확인이 한 번 성공해야 복귀 |
+| `busy` (느림) | 대기열 > `max_waiting`, 429/5xx, 요청 중 응답 타임아웃, 상태 확인 응답 > 3초 | 다른 서버 우선, 모두 바쁠 때만 사용. 응답 없음이 4회 이어지면 `down` |
+| `drained` | 설정 `enabled: false` 또는 `/backends/drain` | 직접 복귀시킬 때까지 보내지 않음 |
+
+같은 포트에 잠시 다른 서버(예: 영상 모델)를 띄우면 `/v1/models`의 모델 이름이 티어 설정과 달라서 자동으로 `down`이 되고, 원래 서버를 다시 띄우면 자동으로 복귀합니다. 프록시가 개발자마다 하나씩 돌기 때문에, 수동 `drain`은 그 프록시에만 적용되지만 자동 판단은 모든 프록시가 같은 결과를 냅니다.
+
+```bash
+curl localhost:8787/backends                                                     # 서버별 state, health.reason
+curl -XPOST localhost:8787/backends/drain -d '{"url":"gpu01:8000","minutes":120}'  # 잠시 빼기
+curl -XPOST localhost:8787/backends/drain -d '{"url":"gpu01:8000","minutes":0}'    # 복귀
+```
+
 ### 외부 모델 예산
 
 레벨은 `normal` → `tight` → `critical`이고, 아래 신호 중 가장 나쁜 값을 씁니다.
